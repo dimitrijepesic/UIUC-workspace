@@ -1,0 +1,1836 @@
+291
+Synthesizing Precise Static Analyzers for Automatic
+Diﬀerentiation
+JACOB LAUREL, University of Illinois at Urbana-Champaign, USA
+SIYUAN BRANT QIAN, University of Illinois at Urbana-Champaign, USA and Zhejiang University, China
+GAGANDEEP SINGH, University of Illinois at Urbana-Champaign and VMware Research, USA
+SASA MISAILOVIC, University of Illinois at Urbana-Champaign, USA
+We present Pasado, a technique for synthesizing precise static analyzers for Automatic Diﬀerentiation. Our
+technique allows one to automatically construct a static analyzer specialized for the Chain Rule, Product Rule,
+and Quotient Rule computations for Automatic Diﬀerentiation in a way that abstracts all of the nonlinear
+operations of each respective rule simultaneously. By directly synthesizing an abstract transformer for the
+composite expressions of these 3 most common rules of AD, we are able to obtain signi/f_icant precision
+improvement compared to prior works which compose standard abstract transformers together suboptimally.
+We prove our synthesized static analyzers sound and additionally demonstrate the generality of our approach
+by instantiating these AD static analyzers with diﬀerent nonlinear functions, diﬀerent abstract domains (both
+intervals and zonotopes) and both forward-mode and reverse-mode AD.
+We evaluate Pasado on multiple case studies, namely computing certi/f_ied bounds on a neural network’s local
+Lipschitz constant, soundly bounding the sensitivities of /f_inancial models, certifying monotonicity, and lastly,
+bounding sensitivities of the solutions of diﬀerential equations from climate science and chemistry for veri/f_ied
+ranges of initial conditions and parameters. The local Lipschitz constants computed by Pasado on our largest
+CNN are up to 2750× more precise compared to the existing state-of-the-art zonotope analysis. Additionally,
+the bounds obtained on the sensitivities of the climate, chemical, and /f_inancial diﬀerential equation solutions
+are between 1. 31− 2. 81× more precise (on average) compared to a state-of-the-art zonotope analysis.
+CCS Concepts: • Mathematics of computing→ Diﬀerential calculus ; Automatic diﬀerentiation ; •
+Theory of computation→ Program analysis; Abstraction.
+Additional Key Words and Phrases: Diﬀerentiable Programming, Abstract Interpretation
+ACM Reference Format:
+Jacob Laurel, Siyuan Brant Qian, Gagandeep Singh, and Sasa Misailovic. 2023. Synthesizing Precise Static
+Analyzers for Automatic Diﬀerentiation. Proc. ACM Program. Lang. 7, OOPSLA2, Article 291 (October 2023),
+29 pages. https://doi.org/10.1145/3622867
+1 INTRODUCTION
+Automatic Diﬀerentiation (AD) has served as the backbone for many applications across Computer
+Science. Indeed, AD has driven much of the modern deep learning revolution since derivative com-
+putations are essential both for training Deep Neural Networks (DNNs) and ensuring trustworthy
+Machine Learning (ML). In particular, guarantees on derivatives are necessary for establishing
+Authors’ addresses:Jacob Laurel, jlaurel2@illinois.edu, University of Illinois at Urbana-Champaign, USA; Siyuan Brant
+Qian, siyuanq4@illinois.edu, University of Illinois at Urbana-Champaign, USA and Zhejiang University, China; Gagandeep
+Singh, ggnds@illinois.edu, University of Illinois at Urbana-Champaign and VMware Research, USA; Sasa Misailovic ,
+misailo@illinois.edu, University of Illinois at Urbana-Champaign, USA.
+Permission to make digital or hard copies of all or part of this work for personal or classroom use is granted without fee
+provided that copies are not made or distributed for pro/f_it or commercial advantage and that copies bear this notice and the
+full citation on the /f_irst page. Copyrights for components of this work owned by others than the author(s) must be honored.
+Abstracting with credit is permitted. To copy otherwise, or republish, to post on servers or to redistribute to lists, requires
+prior speci/f_ic permission and/or a fee. Request permissions from permissions@acm.org.
+© 2023 Copyright held by the owner/author(s). Publication rights licensed to ACM.
+2475-1421/2023/10-ART291
+https://doi.org/10.1145/3622867
+Proc. ACM Program. Lang., Vol. 7, No. OOPSLA2, Article 291. Publication date: October 2023.
+
+291:2 Jacob Laurel, Siyuan Brant Qian, Gagandeep Singh, Sasa Misailovic
+many important properties in ML systems, e.g., certifying Lipschitz bounds of DNNs [ Jordan and
+Dimakis 2020], demonstrating privacy of DNNs [ Rosenberg et al . 2023], proving fairness [ Gupta
+et al. 2021] or providing explanations of how DNNs make their decisions [ Lerman et al. 2021]. AD is
+also used extensively in scienti/f_ic computing for tasks as diverse as climate modeling [Mametjanov
+et al. 2012], analyzing diﬀerential equations [ Bendtsen and Stauning 1996 ; Ma et al . 2021] and
+sensitivity analysis [Hovland et al. 2005]. Formalizations of derivatives computed using AD and
+their properties also have widespread use in Graphics [ Bangaru et al. 2021 ; Yang et al. 2022].
+Given the importance of formalizing properties over derivatives, formal veri/f_ication techniques
+have recently been applied to AD [ Hückelheim and Hascoët 2022 ; Hückelheim et al. 2018; Jordan
+and Dimakis 2021; Laurel et al. 2022a]. In particular, abstract interpretation [ Cousot and Cousot
+1977] has been used to statically analyze AD code [ Jordan and Dimakis 2021 ; Laurel et al. 2022a;
+Vassiliadis et al. 2016] to ensure guaranteed bounds on derivatives.
+Existing Abstract Interpretation work focuses primarily on developing precise abstract trans-
+formers for linear operations and assignments [ Cousot and Halbwachs 1978 ; Singh et al . 2017].
+However, AD computations are highly non-linear. Compared to just the original program (called the
+primal), the derivative program AD computes (called the adjoint) can have 2-5× more non-linear
+operations [Griewank and Walther 2008], e.g., for the most common operations:
+• Every composition with a non-linear function in the primal requires a separate composition with
+that function’s derivative in the adjoint and an additional multiplication, due to the chain rule.
+• A single multiplication in the primal leads to 2 separate multiplications in the adjoint due to the
+product rule.
+• A single division in the primal leads to 4 nonlinear operations in the adjoint due to quotient rule.
+While one could reduce these groups of nonlinear operations to a series of basic (nonlinear) primi-
+tives, and then compose the corresponding primitives’ abstract transformers, this construction loses
+precision. Even leveraging variable sharing in AD programs to reduce the number of applications
+of those basic abstract transformers, as in Laurel et al. [2022b] still loses precision as our evaluation
+will show. While one could try to design custom abstract transformers for groups of nonlinear
+operations, as in Singh et al. [2019a], this idea requires signi/f_icant human expertise to handcraft
+the transformers and must be redone for each diﬀerent function (e.g. tanh(/u1D465),/u1D70E(/u1D465)) [Fryazinov
+et al. 2010] and for each diﬀerent abstract domain. Hence to date, there exists no general recipe for
+constructing AD static analyzers which can precisely abstract multiple non-linear operations for
+diﬀerent functions, support multiple abstract domains and support both modes of AD.
+Challenges. We focus on developing a general technique to synthesize precise static analyzers
+tailored to the needs and structure of AD. By abstracting multiple nonlinear computations all at once
+instead of suboptimally composing abstractions of each primitive operation, we seek to signi/f_icantly
+improve the precision of the abstract interpretation of AD. Lastly, we seek to remove the burden
+on the abstraction designer from having to design transformers for each function and each abstract
+domain and each mode of AD. However, this approach must overcome two major challenges:
+(1)
+Determine the right granularity for the abstraction. While grouping more operations together
+for the abstraction improves precision, the diﬃculty in synthesizing abstract transformers scales
+with the number of operations due to the need to solve multivariate optimization problems.
+Hence we must identify patterns to abstract that strike a balance between scalability and preci-
+sion. The composite abstraction of a group of AD operations should be general enough to yield
+eﬃcient and precise static analyzers for (1) multiple diﬀerent functions (e.g. /u1D70E(/u1D465), exp(/u1D465),√/u1D465)
+and (2) be instantiated with diﬀerent abstract domains (e.g. interval, zonotope [ Ghorbal et al.
+2009], DeepPoly [Singh et al. 2019b]). Finally, we want to make sure the AD patterns we abstract
+are general enough to support both forward-mode and reverse-mode AD.
+Proc. ACM Program. Lang., Vol. 7, No. OOPSLA2, Article 291. Publication date: October 2023.
+Synthesizing Precise Static Analyzers for Automatic Diﬀerentiation 291:3
+(2)
+Prove the synthesis procedure obtains sound abstract transformers for diﬀerent functions and
+abstract domains. To synthesize an abstract transformer for a group of nonlinear operations
+over multiple variables, one must /f_irst solve a multi-dimensional, non-convex optimization
+problem to obtain soundness guarantees. However, we also want the proof techniques used to
+prove soundness to be general so that we can easily apply them to diﬀerent nonlinear functions
+as well as have these proof technique support diﬀerent abstract domains.
+Our Work. To address these challenges, we propose Pasado. The main idea of Pasado is to
+soundly synthesize precise linear abstract transformers that are tailored to the Chain rule, Product
+Rule and Quotient Rule expressions of AD. Given their ubiquity in AD programs, we have identi/f_ied
+that these patterns strike a desirable balance between eﬃciency, precision and tractability of the
+synthesized transformers. Pasado synthesizes sound abstract transformers for these composite,
+multivariate, nonlinear AD expressions directly instead of naively composing standard abstractions
+for each primitive nonlinear operation together. Additionally, Pasado supports both forward- and
+reverse-mode AD. Pasado’s procedure is automated, hence one need not design hand-crafted
+abstract transformers as in Singh et al . [2018] and Du et al . [2021]. Furthermore, Pasado is general
+enough to support diﬀerent function primitives and diﬀerent abstract domains so that this idea can
+be fully leveraged to synthesize general static analyzers for diﬀerentiable programming languages.
+Lastly, Pasado is tractable, scalable and eﬃcient enough to analyze large computations such as
+automatically diﬀerentiating through Convolutional Neural Networks (CNNs).
+Pasado synthesizes these abstract transformers using a multi-step procedure. We /f_irst use linear
+regression to /f_it a hyperplane to the pattern we are trying to abstractly interpret. This step involves
+sub-sampling the AD expression at concrete points in a given input interval and using those
+evaluations for the linear regression. These input bounds may come from variables in the primal,
+hence Pasado simultaneously uses existing abstract interpretation methods to obtain bounds on the
+primal. Additionally, because the hyperplane is only a linear approximation it is unsound, hence we
+must also account for the deviation between this hyperplane and the original function to maintain
+soundness. Thus we solve for the maximum deviation between this hyperplane and the original
+AD expression we are abstracting and use this deviation to obtain sound linear bounds enclosing
+the hyperplane. A core part of our contribution is the mathematical proof of an eﬃcient solution
+to this maximization problem. Speci/f_ically, we show how to provably rule out virtually all critical
+points, eﬀectively reducing this optimization problem to examining boundary points.
+We evaluate Pasado on multiple Case Studies including (1) robust sensitivity analysis of ODE
+solutions for both Neural ODEs and climate models, (2) provable bounds on sensitivities of /f_inancial
+models, (3) local Lipschitz robustness certi/f_ication and (4) monotonicity certi/f_ication. Due to
+Pasado’s precision and scalability, the bounds obtained on the sensitivities of the climate, chemical,
+and /f_inancial diﬀerential equation solutions are between1. 31− 2. 81× more precise (on average)
+compared to a state-of-the-art zonotope AD analysis and on our largest CNN, the local Lipschitz
+constants computed by Pasado are up to 2750× more precise compared to the existing state-of-the-
+art zonotope AD analysis from Laurel et al. [2022b].
+Contributions. In summary, this paper makes the following contributions:
+(1) Approach. We present Pasado, a general formalism for synthesizing precise static analyzers
+for composite AD expressions. Due to Pasado’s generality, this approach can be instantiated
+for a broad class of functions with both forward and reverse mode AD and with diﬀerent
+abstract domains. (Sections 4.1-4.3)
+(2) Guarantees. We formally prove the soundness of the abstract transformers synthesized by
+Pasado (Section 4.4) and theorems about their precision and generality (Sections 4.5-4.6).
+Proc. ACM Program. Lang., Vol. 7, No. OOPSLA2, Article 291. Publication date: October 2023.
+291:4 Jacob Laurel, Siyuan Brant Qian, Gagandeep Singh, Sasa Misailovic
+(3) Implementation. We implement Pasado as a practical tool and instantiate it with both
+forward- and reverse-mode AD, as well as both the interval and zonotope domains and their
+reduced product. (Section 5.1). Pasado is available at https://github.com/uiuc-arc/Pasado.
+(4) Evaluation. We experimentally show the bene/f_it of Pasado on Lipschitz certi/f_ication, mono-
+tonicity analysis and diﬀerential equation models from chemistry, /f_inance, and climate
+science, and derive polyhedral bounds on sensitivities of these ODE solutions for the /f_irst
+time. (Sections 5.2-5.5)
+2 EXAMPLE
+We next proceed with a simple example illustrating our technique.
+Running Example. A key application of static analysis of Automatic Diﬀerentiation that we
+target in this work is for robust sensitivity analysis of ordinary diﬀerential equation (ODE) solvers.
+We note that we are the /f_irst to consider such a static analysis. Our running example consists of
+automatically diﬀerentiating through the ODE solver (as in Ma et al . [2021]) for a simple ODE. Our
+ODE is a popular energy balance model used in climate science [ Kaper and Engler 2013 ], where the
+global temperature/u1D447is a function of time /u1D461and/u1D444,/u1D445,/u1D6FC,/u1D452are the global insolation, heat capacity,
+albedo and (scaled) emissivity parameters respectively. This ODE is given as:
+/u1D451/u1D447
+/u1D451/u1D461= /u1D444·( 1−/u1D6FC)− /u1D452·/u1D4474
+/u1D445 (1)
+The program that we will statically analyze solves this ODE numerically, thus obtaining a
+sequence[/u1D4470,...,/u1D447 /u1D45A] of temperatures for/u1D45Atime steps. To solve the ODE numerically, we will need
+the system dynamics function (RHS of Eq. 1) which as can be seen, is described by the function
+/u1D453(/u1D447,/u1D461,/u1D444,/u1D6FC,/u1D452,/u1D445) = /u1D444·( 1−/u1D6FC)−/u1D452·/u1D4474
+/u1D445 . The program for a simple Euler ODE solver applied to Eq. 1, which
+we will denote as ODESolve/u1D453is given below:
+1 f u n c t i o nODESolve /u1D453(/u1D444,/u1D6FC,/u1D452,/u1D445,/u1D4610,/u1D4470,/u1D460/u1D461/u1D452/u1D45D_/u1D460/u1D456/u1D467/u1D452,/u1D460/u1D461/u1D452/u1D45D/u1D460) :
+2 f o r ( i = 1 ; i < /u1D460/u1D461/u1D452/u1D45D/u1D460; i + + ) {
+3 /u1D447/u1D456= /u1D447/u1D456−1 + /u1D453(/u1D447/u1D456−1,/u1D461/u1D456−1,/u1D444,/u1D6FC,/u1D452,/u1D445)· /u1D460/u1D461/u1D452/u1D45D_/u1D460/u1D456/u1D467/u1D452/ / E u l e r i n t e g r a t o r
+4 /u1D461/u1D456= /u1D461/u1D456−1 + /u1D460/u1D461/u1D452/u1D45D_/u1D460/u1D456/u1D467/u1D452}
+5 r e t u r n T , t
+Thus by solving the ODE numerically (instead of symbolically) we can automatically diﬀerentiate
+through the numerical ODE solver itself, to get the derivative of the numerical solver’s output with
+respect to the initial condition inputs, in this case /u1D4470.
+Applying AD to ODESolve is possible because ODESolve is itself a diﬀerentiable program since
+it performs only diﬀerentiable operations, which are just addition, multiplication (by the step size),
+as well as the multiplications, division, subtraction, and the ( 4/u1D461/uni210E) power function found inside of
+the dynamics /u1D453. Automatically diﬀerentiating through ODESolve will allow us to better understand
+how sensitive the numerical solution of ODEs are to diﬀerent initial conditions or parameters (e.g.
+diﬀerent values of /u1D452or/u1D445). Hence we will ultimately compute
+/u1D715ODESolve/u1D453(/u1D444,/u1D6FC,/u1D452,/u1D445,/u1D4610,/u1D4470,/u1D460/u1D461/u1D452/u1D45D_/u1D460/u1D456/u1D467/u1D452,/u1D460/u1D461/u1D452/u1D45D/u1D460)
+/u1D715/u1D4470
+.
+Abstract Sensitivity Analysis. However, our goal is to not just automatically diﬀerentiate
+through ODESolve to perform the sensitivity analysis at individual points (as done in Ma et al .
+[2021]), rather our goal is to abstractly compute these sensitivities for an entire range of initial
+conditions. Furthermore, since the physical parameters of this climate ODE can vary (e.g. /u1D452has
+dependence on the weather), we want this sensitivity analysis to capture an entire range of feasible
+parameter values. This abstract sensitivity analysis is performed by abstractly interpreting AD
+applied to the ODE solver. Hence we abstractly compute
+/u1D715ODESolve/u1D453(/u1D444,/u1D6FC,/u1D452,/u1D445,/u1D4610,/u1D4470,/u1D460/u1D461/u1D452/u1D45D_/u1D460/u1D456/u1D467/u1D452,/u1D460/u1D461/u1D452/u1D45D/u1D460)
+/u1D715/u1D4470
+for
+Proc. ACM Program. Lang., Vol. 7, No. OOPSLA2, Article 291. Publication date: October 2023.
+Synthesizing Precise Static Analyzers for Automatic Diﬀerentiation 291:5
+1 T [ 0 ] . r e a l , T [ 0 ] . d u a l = . . . / / These values are passed in as inputs
+2 e . r e a l , e . d u a l = . . .
+3 R . r e a l , R . d u a l = . . .
+4 s t e p _ s i z e = . . . / / always treated as /f_ixed scalar constant
+5 Q , a l p h a = . . . / / treated as /f_ixed scalar constants for this example
+6 C = Q ∗( 1 − a l p h a ) / / constant propagation for Q and alpha (both are constants)
+7
+8 i 1 . r e a l = FourthPower ( T [ 0 ] . r e a l ) / / Computes Line 3 of ODESolve/u1D453
+9 i 1 . d u a l = 4 ∗Cube ( T [ 0 ] . r e a l ) ∗T [ 0 ] . d u a l / / Chain Rule
+10
+11 i 2 . r e a l = e . r e a l ∗ i 1 . r e a l
+12 i 2 . d u a l = ( e . r e a l ∗ i 1 . d u a l ) + ( e . d u a l ∗ i 1 . r e a l ) / / Product Rule
+13
+14 i 3 . r e a l , i 3 . d u a l = C − i 2 . r e a l , − i 2 . d u a l / / Linearity
+15
+16 i 4 . r e a l = i 3 . r e a l / R . r e a l
+17 i 4 . d u a l = ( ( i 3 . d u a l ∗R . r e a l ) − ( i 3 . r e a l ∗R . d u a l ) ) / Square ( R . r e a l ) / / Quotient Rule
+18
+19 T [ 1 ] . r e a l , T [ 1 ] . d u a l = ( s t e p _ s i z e ∗ i 4 . r e a l ) + T [ 0 ] . r e a l , ( s t e p _ s i z e ∗ i 4 . d u a l ) + T [ 0 ] . d u a l
+Fig. 1. Unrolled AD source code for diﬀerentiating a single iteration of ODESolve/u1D453
+various ranges of/u1D4470,/u1D452and/u1D445. This abstract sensitivity analysis can be viewed as a static analysis
+(using abstract interpretation) of a diﬀerentiable program, in this case the ODESolve program.
+Speci/f_ication. By performing the AD-based sensitivity analysis abstractly for ranges of initial
+conditions and parameter values, we can ultimately prove properties like the monotonicity of
+the numerical ODE solution with respect to the initial values for all values in the given input
+ranges. Proving monotonicity of the /f_inal ODE solution with respect to the initial conditions has
+been shown to be important for understanding physical processes [ Wang et al . 2022]. Proving
+monotonicity of the output of this climate model with respect to the initial temperature conditions
+for a range of values and atmospheric conditions, allows us to prove properties such as the future
+temperature (after/u1D441time steps) being a strictly increasing function of the current temperature (the
+initial condition), even under a range of diﬀerent atmospheric conditions. Thus, our goal in this
+example is to prove monotonicity of the future temperature computed by ODESolve/u1D453with respect
+to the initial temperature,/u1D4470 after/u1D441= 12 steps when both/u1D4470 and the atmospheric conditions are
+known only up to some interval. We will prove this property by certifying that the derivative is
+always non-zero. While abstract interpretation of AD has been done before [ Laurel et al. 2022a,b;
+Vassiliadis et al. 2016], we will soon see that those techniques are not precise enough to prove the
+monotonicity property that we are interested in.
+Example Source Code. Since ODE solvers run for a /f_ixed, /f_inite number of iterations, conceptu-
+ally they can be unrolled. Hence the /f_irst step is to unroll the ODE solver program into straight-line
+code that we can abstractly interpret. For illustration simplicity, Pasado’s abstract AD applied to
+a single iteration of ODESolve/u1D453is shown in Fig. 1, however, Pasado can analyze any /f_ixed, /f_inite
+number of iterations, though more iterations will diminish the precision. Indeed, the full results of
+Pasado’s analysis after 12 iterations are later shown in Fig. 3. Since we are performing AD, we must
+also keep track of each variable’s derivative. For this example, we elect for forward mode AD, hence
+we store each variable’s value in the real component and its derivative in the associated dual
+component, as we encode derivatives using the canonical dual numbers [Griewank and Walther
+2008]. Hence, our concrete semantics are /f_irst-order version of [Laurel et al. 2022b]. As will be seen
+later, our approach is general enough to support both forward and reverse mode AD. Lines 1-5
+correspond to program statements that read in and store the input values for the initial condition
+/u1D4470, as well as the parameter values for /u1D444,/u1D6FC,/u1D452and/u1D445.
+Chain Rule. On line 9, we compute the derivative of composing the 4/u1D461/uni210Epower function with
+the input variable/u1D4470, stored in variable i1. Due to the chain rule, this step also requires multiplying
+Proc. ACM Program. Lang., Vol. 7, No. OOPSLA2, Article 291. Publication date: October 2023.
+291:6 Jacob Laurel, Siyuan Brant Qian, Gagandeep Singh, Sasa Misailovic
+by T[0].dual. We compute the derivative of this function application using the chain rule, where
+in this case /u1D451
+/u1D451/u1D4470
+/u1D4474
+0 = 4/u1D4473
+0 . Between the cube function ( Cube(T[0])), and the multiplication by
+T[0].dual, there are 3 nonlinear operations (all multiplications) involved in the computation of
+i1.dual. These multiple nonlinear operations pose a direct challenge for the subsequent abstract
+interpretation, however, as we will see, Pasado is speci/f_ically designed to overcome this challenge.
+Product Rule. To propagate derivatives through the computation, we now need to compute
+the derivative of the product of /u1D4474 with/u1D452. This step involves computing the product rule for
+the program variables i1 and e. However, as can be seen on line 12, the product rule involves 2
+nonlinear multiplication operations. Upon computing both the product of /u1D4474 with/u1D452(line 11) and its
+derivative (line 12), we next execute line 14 to compute the diﬀerence of this product with /u1D444·( 1−/u1D44E),
+which has already been stored in variable C in line 6. Because of linearity, the derivative of this
+diﬀerence (line 14) is straightforward to compute. Thus upon completion of line 14, we /f_inally have
+computed both the numerator of the dynamics function /u1D453, and its associated derivative.
+Quotient Rule. Having computed the intermediate expression needed for the numerator, we
+next come to the division operation shown in line 16. To compute the derivative of this division,
+AD must compute the quotient rule, as shown in line 17. It is important to see that the quotient rule
+has 4 nonlinear operations, which as mentioned, pose challenges for precise abstract interpretation.
+Upon computing the quotient and its derivative (with respect to /u1D4470), we /f_inally compute the value
+of the next time step, /u1D4471 and its associated derivative in line 19. Thus we now have both the value
+of the temperature at the next time step as well as the derivative of the temperature at the next
+time step with respect to the initial condition, which is just
+/u1D715ODESolve/u1D453(/u1D444,/u1D6FC,/u1D452,/u1D445,/u1D4610,/u1D4470,/u1D460/u1D461/u1D452/u1D45D_/u1D460/u1D456/u1D467/u1D452,/u1D460/u1D461/u1D452/u1D45D/u1D460)
+/u1D715/u1D4470
+. We
+will next see how to abstractly interpret this AD computation precisely using Pasado.
+Precise Abstract Interpretation with Pasado. As observed in the preceding description,
+there are multiple nonlinear operations involved in computing the derivatives that are stored
+in the intermediate variables’
+dual components. These nonlinearities present a challenge for
+precise abstract interpretation, as precise numerical abstract domains like zonotopes and polyhedra
+were originally designed for analyzing linear functions and are thus not well suited for handling
+nonlinear operations [ Adjé et al . 2010]. For instance, with the zonotope abstract domain, each
+nonlinear operation introduces a new noise symbol, thus the large number of nonlinear operations
+(like multiplications) in AD runs the risk of substantial over-approximation. Existing abstract
+interpretations for AD [ Laurel et al. 2022a,b] suﬀer from these weaknesses and, as we will later see,
+produce bounds that are too loose to be useful for our analysis.
+For this example, we will use the reduced product of the zonotope domain with intervals
+to represent our abstraction. Pasado’s synthesis method produces precise abstractions for both
+domains improving the precision of the reduced product. As we will later see, our construction is
+general and thus could be instantiated with other abstract domains such as the DeepPoly domain
+or quadratic zonotopes. Since we are using the reduced product of zonotopes with intervals, the
+abstract program state is shown in purple where /LbagVar =/u1D44E0+/summationtext.1
+/u1D457/u1D44E/u1D457/u1D716/u1D457,/u1D459/u1D449/u1D44E/u1D45F=/u1D450/u1D459,/u1D462/u1D449/u1D44E/u1D45F=/u1D450/u1D462/Rbagsigni/f_ies
+that variable/u1D449/u1D44E/u1D45F(which could be either a real or dual component) is abstractly represented with
+aﬃne form /u1D44E0+ /summationtext.1
+/u1D457/u1D44E/u1D457/u1D716/u1D457, but also maintains, tighter, re/f_ined bounds[/u1D450/u1D459,/u1D450/u1D462]. Here/u1D44E/u1D457,/u1D450/u1D459,/u1D450/u1D462∈ R and
+each/u1D716/u1D457∈[− 1, 1] is a noise symbol, which intuitively is a term in a /f_irst-order symbolic polynomial.
+Fig. 2 shows the abstract interpretation of the original source code. In this example we want to
+abstractly compute guaranteed bounds on
+/u1D715ODESolve/u1D453(/u1D444,/u1D6FC,/u1D452,/u1D445,/u1D4610,/u1D4470,/u1D460/u1D461/u1D452/u1D45D_/u1D460/u1D456/u1D467/u1D452,/u1D460/u1D461/u1D452/u1D45D/u1D460)
+/u1D715/u1D4470
+when/u1D4470∈[ 275, 400],
+/u1D445∈[ 2. 65, 2. 95],/u1D452∈[ 0. 6/u1D70E,0. 9/u1D70E],/u1D6FC= 0. 3,/u1D444= 342,/u1D460/u1D461/u1D452/u1D45D_/u1D460/u1D456/u1D467/u1D452= 0. 025 and/u1D460/u1D461/u1D452/u1D45D/u1D460= 1. For the scaled
+emmisivity/u1D452, the value of /u1D70Eis the Stefan-Boltzmann constant 5. 67· 10−8. Thus to specify these
+bounds over the input, we initialize the abstract program state as shown in lines 2-16.
+Proc. ACM Program. Lang., Vol. 7, No. OOPSLA2, Article 291. Publication date: October 2023.
+Synthesizing Precise Static Analyzers for Automatic Diﬀerentiation 291:7
+Synthesized Abstraction for Chain Rule.The /f_irst computation we perform is the computation
+of the quartic power function on line 18 and its derivative on line 21. As our contribution is focused
+solely on constructing synthesized abstraction for just the derivative terms, we use the standard
+interval and zonotope multiplication abstract transformers for the quartic function on line 18.
+It is important to note that after abstractly executing line 18 but before executing line 21, the
+zonotope abstract state will have 8 noise symbols /u1D7161−8. To abstractly interpret line 21, we use
+Pasado’s synthesized abstract transformer instead of the standard zonotope multiplication abstract
+transformer. The /f_irst step of Pasado’s synthesis procedure is to solve a linear regression problem
+for/u1D434,/u1D435,/u1D436∈ R such that within the box [/u1D459/u1D447[0]./u1D45F/u1D452/u1D44E/u1D459,/u1D462/u1D447[0]./u1D45F/u1D452/u1D44E/u1D459]×[ /u1D459/u1D447[0]./u1D451/u1D462/u1D44E/u1D459,/u1D462/u1D447[0]./u1D451/u1D462/u1D44E/u1D459]⊂ R2:
+/u1D434·(/u1D447[0]./u1D45F/u1D452/u1D44E/u1D459)+ /u1D435·(/u1D447[0]./u1D451/u1D462/u1D44E/u1D459)+ /u1D436≈ 4·(/u1D447[0]./u1D45F/u1D452/u1D44E/u1D459)3·(/u1D447[0]./u1D451/u1D462/u1D44E/u1D459)
+Pasado performs this step by sampling uniformly-spaced points in the box, which here is
+[275, 400]×[ 1, 1]. For each sampled point/u1D465/u1D456,/u1D466.alt/u1D456we evaluate 4/u1D4653
+/u1D456·/u1D466.alt/u1D456which is used as the “ground-truth”
+for the linear regression. For this example linear regression produces the result:/u1D434= 1378673. 47,/u1D435=
+0,/u1D436=−304748724. 48. Hence the aﬃne form will be /hat5/u1D4561./u1D451/u1D462/u1D44E/u1D459=/u1D434/hat6/u1D447[0]./u1D45F/u1D452/u1D44E/u1D459+/u1D435/hat6/u1D447[0]./u1D451/u1D462/u1D44E/u1D459+/u1D436+/u1D437/u1D716/u1D45B/u1D452/u1D464,
+where/u1D716/u1D45B/u1D452/u1D464is a single new noise symbol and the ˆ/uni210E/u1D44E/u1D461notation denotes the variable’s aﬃne form
+stored in the abstract state. The next step is computing /u1D437by soundly bounding the error between
+this linear approximation and the true function 4·(/u1D447[0]./u1D45F/u1D452/u1D44E/u1D459)3·(/u1D447[0]./u1D451/u1D462/u1D44E/u1D459), as shown in Eq. 2
+/u1D437= max
+/u1D465∈[ 275, 400],/u1D466.alt∈[ 1, 1]
+|4/u1D4653·/u1D466.alt−(/u1D434/u1D465+/u1D435/u1D466.alt+/u1D436)| (2)
+Noting that [/u1D459/u1D447[0]./u1D45F/u1D452/u1D44E/u1D459,/u1D462/u1D447[0]./u1D45F/u1D452/u1D44E/u1D459] = [275, 400] and[/u1D459/u1D447[0]./u1D451/u1D462/u1D44E/u1D459,/u1D462/u1D447[0]./u1D451/u1D462/u1D44E/u1D459] = [1, 1]. While at /f_irst
+glance this may seem like a diﬃcult nonconvex, multivariable optimization problem a core con-
+tribution of Pasado is proving that we can reduce this multivariable optimization problem to
+simpler 1D optimization subproblems as well as just checking the corner points. Hence we can
+actually /f_ind theexact value of
+/u1D437by solving for roots of 12(/u1D447[0]./u1D45F/u1D452/u1D44E/u1D459)2·/u1D459/u1D447[0]./u1D451/u1D462/u1D44E/u1D459−/u1D434= 0 and
+12(/u1D447[0]./u1D45F/u1D452/u1D44E/u1D459)2·/u1D462/u1D447[0]./u1D451/u1D462/u1D44E/u1D459−/u1D434= 0, checking those roots and additionally checking the corner
+points{/u1D459/u1D447[0]./u1D45F/u1D452/u1D44E/u1D459,/u1D462/u1D447[0]./u1D45F/u1D452/u1D44E/u1D459}×{ /u1D459/u1D447[0]./u1D451/u1D462/u1D44E/u1D459,/u1D462/u1D447[0]./u1D451/u1D462/u1D44E/u1D459}. The coeﬃcient /u1D437will be used as the new noise
+symbol’s magnitude to ensure the linear approximation is still a sound zonotopic enclosure.
+An important detail is that because of our technique, the abstract transformer for the composite
+expression 4*Cube(T[0].real)*T[0].dual only introduces a single new noise symbol (/u1D437/u1D716/u1D45B/u1D452/u1D464),
+hence why there are only nine noise symbols ( /u1D7161−9) as shown in line 22. This insight is critical, as
+evaluating the same expression with the standard zonotope multiplications would introduce three
+noise symbols instead of one. It is known that having fewer noise symbols can lead to computational
+savings [Turner 2020], and this reduction helps us oﬀset some of the cost of synthesizing trans-
+formers. Furthermore, we can use the same technique to solve the simpler optimization problems
+min
+/u1D465∈[ 275, 400],/u1D466.alt∈[ 1, 1]
+4/u1D4653·/u1D466.altand max
+/u1D465∈[ 275, 400],/u1D466.alt∈[ 1, 1]
+4/u1D4653·/u1D466.alt, which can be used to give us re/f_ined interval
+lower and upper bounds, which in this case are [8. 318· 107, 2. 56· 108]. While these bounds appear
+large, they will eventually be scaled to a tight range upon multiplication with /u1D452since/u1D452< 10−7.
+Further, while in this case these interval bounds are identical to those obtained via standard interval
+arithmetic, for other functions, our optimally solved bounds are often much more precise. We
+take the intersection of the bounding box of the aﬃne form which is [6. 759· 107, 2. 56· 108] with
+[8. 318· 107, 2. 56· 108] to get the /f_inal re/f_ined lower and upper bounds. In this case the re/f_ined
+interval bounds obtained by solving the two simpler optimization problems are strictly tighter
+than the aﬃne form’s bounding box (hence the result is still [8. 318· 107, 2. 56· 108]), however, this
+need not always be true, hence why we take the intersection. A key bene/f_it of our approach is that
+because our abstract transformers use interval bounds to solve their optimization problem they
+Proc. ACM Program. Lang., Vol. 7, No. OOPSLA2, Article 291. Publication date: October 2023.
+291:8 Jacob Laurel, Siyuan Brant Qian, Gagandeep Singh, Sasa Misailovic
+1 T [ 0 ] . r e a l , T [ 0 ] . d u a l = . . . / / These values are passed in as inputs
+2 /LbagT[0].real = 337.5 + -62.5/u1D7161,/u1D459/u1D447[0]./u1D45F/u1D452/u1D44E/u1D459= 275,/u1D462/u1D447[0]./u1D45F/u1D452/u1D44E/u1D459= 400 /Rbag
+3 /LbagT[0].dual = 1,/u1D459/u1D447[0]./u1D451/u1D462/u1D44E/u1D459= 1,/u1D462/u1D447[0]./u1D451/u1D462/u1D44E/u1D459= 1 /Rbag
+4 e . r e a l , e . d u a l = . . .
+5 /Lbage.real = 4. 25· 10−8 + -8. 50· 10−9/u1D7163,/u1D459/u1D452./u1D45F/u1D452/u1D44E/u1D459= 3. 40· 10−8,/u1D462/u1D452./u1D45F/u1D452/u1D44E/u1D459= 5. 1· 10−8 /Rbag
+6 /Lbage.dual = 0,/u1D459/u1D452./u1D451/u1D462/u1D44E/u1D459= 0,/u1D462/u1D452./u1D451/u1D462/u1D44E/u1D459= 0 /Rbag
+7 R . r e a l , R . d u a l = . . .
+8 /LbagR.real = 2.8 + - 0. 15/u1D7165,/u1D459/u1D445./u1D45F/u1D452/u1D44E/u1D459= 2. 65,/u1D462/u1D445./u1D45F/u1D452/u1D44E/u1D459= 2. 95 /Rbag
+9 /LbagR.dual = 0,/u1D459/u1D445./u1D451/u1D462/u1D44E/u1D459= 0,/u1D462/u1D445./u1D451/u1D462/u1D44E/u1D459= 0 /Rbag
+10 s t e p _ s i z e = . . . / / always treated as /f_ixed scalar constant
+11 /Lbagstep_size = 0.025,/u1D459/u1D460/u1D461/u1D452/u1D45D_/u1D460/u1D456/u1D467/u1D452= 0. 025,/u1D462/u1D460/u1D461/u1D452/u1D45D_/u1D460/u1D456/u1D467/u1D452= 0. 025 /Rbag
+12 Q , a l p h a = . . . / / treated as /f_ixed scalar constants for this example
+13 /LbagQ = 342,/u1D459/u1D444= 342,/u1D462/u1D444= 342 /Rbag
+14 /Lbagalpha = 0.3,/u1D459/u1D44E/u1D459/u1D45D/uni210E/u1D44E= 0. 3,/u1D462/u1D44E/u1D459/u1D45D/uni210E/u1D44E= 0. 3 /Rbag
+15 C = Q ∗( 1 − a l p h a ) / / constant propagation for Q and alpha (both are constants)
+16 /LbagC = 239.4,/u1D459/u1D436= 239. 4,/u1D462/u1D436= 239. 4 /Rbag
+17
+18 i 1 . r e a l = FourthPower ( T [ 0 ] . r e a l ) / / Computes Line 3 of ODESolve/u1D453
+19 /Lbagi1.real = 12974633789.062 + -9610839843.75/u1D7161 + 889892578.12/u1D7167 + 2124633789.062/u1D7168,
+20 /u1D459/u1D4561./u1D45F/u1D452/u1D44E/u1D459= 5719140625,/u1D462/u1D4561./u1D45F/u1D452/u1D44E/u1D459= 25600000000 /Rbag
+21 i 1 . d u a l = 4 ∗Cube ( T [ 0 ] . r e a l ) ∗T [ 0 ] . d u a l / / Chain Rule
+22 /Lbagi1.dual = 161798882.57 + -86167091.83/u1D7161 + 8034025.58/u1D7169,/u1D459/u1D4561./u1D451/u1D462/u1D44E/u1D459= 83187500,/u1D462/u1D4561./u1D451/u1D462/u1D44E/u1D459= 256000000 /Rbag
+23
+24 i 2 . r e a l = e . r e a l ∗ i 1 . r e a l
+25 /Lbagi2.real = 551.78 + -408.72/u1D7161 + -110.35/u1D7163 + 37.84/u1D7167 + 90.35/u1D7168 + 107.38/u1D71610,/u1D459/u1D4562./u1D45F/u1D452/u1D44E/u1D459= 194. 57,/u1D462/u1D4562./u1D45F/u1D452/u1D44E/u1D459= 1306. 45 /Rbag
+26 i 2 . d u a l = ( e . r e a l ∗ i 1 . d u a l ) + ( e . d u a l ∗ i 1 . r e a l ) / / Product Rule
+27 /Lbagi2.dual = 6.88 + -3.66/u1D7161 + 2.94e-15/u1D7167 + 7.03e-15/u1D7168 + 0.34/u1D7169 + 2.17/u1D71611,/u1D459/u1D4562./u1D451/u1D462/u1D44E/u1D459= 2. 83,/u1D462/u1D4562./u1D451/u1D462/u1D44E/u1D459= 13. 06 /Rbag
+28
+29 i 3 . r e a l , i 3 . d u a l = C − i 2 . r e a l , − i 2 . d u a l / / Linearity
+30 /Lbagi3.real = -312.38 + 408.72/u1D7161 + 110.35/u1D7163 + -37.84/u1D7167 + -90.35/u1D7168 + -107.38/u1D71610,/u1D459/u1D4563./u1D45F/u1D452/u1D44E/u1D459=−1067. 05,/u1D462/u1D4563./u1D45F/u1D452/u1D44E/u1D459= 44. 82 /Rbag
+31 /Lbagi3.dual = -6.88 + 3.66/u1D7161 + -2.94e-15/u1D7167 + -7.03e-15/u1D7168 + -0.34/u1D7169 + -2.17/u1D71611,/u1D459/u1D4563./u1D451/u1D462/u1D44E/u1D459=−13. 06,/u1D462/u1D4563./u1D451/u1D462/u1D44E/u1D459=−2. 83 /Rbag
+32
+33 i 4 . r e a l = i 3 . r e a l / R . r e a l
+34 /Lbagi4.real = -111.9 + 146.39/u1D7161 + 39.52/u1D7163 + -5.38/u1D7165 + -13.55/u1D7167 + -32.36/u1D7168 + -38.46/u1D71610 + -0.61/u1D71612 + 14.48/u1D71613,
+35 /u1D459/u1D4564./u1D45F/u1D452/u1D44E/u1D459=−402. 66,/u1D462/u1D4564./u1D45F/u1D452/u1D44E/u1D459= 16. 91 /Rbag
+36 i 4 . d u a l = ( ( i 3 . d u a l ∗R . r e a l ) − ( i 3 . r e a l ∗R . d u a l ) ) / Square(R.real) // Quotient Rule
+37 /Lbagi4.dual = -2.47 + 1.31/u1D7161 + -0.0009/u1D7163 + -0.15/u1D7165 + 0.0003/u1D7167 + 0.0007/u1D7168 + 0.0009/u1D71610 + -0.12/u1D7169 + -0.78/u1D71611 + 0.11/u1D71614,
+38 /u1D459/u1D4564./u1D451/u1D462/u1D44E/u1D459= -4. 93,/u1D462/u1D4564./u1D451/u1D462/u1D44E/u1D459= -0. 96/Rbag
+39
+40 T [ 1 ] . r e a l , T [ 1 ] . d u a l = ( s t e p _ s i z e ∗ i 4 . r e a l ) + T [ 0 ] . r e a l , ( s t e p _ s i z e ∗ i 4 . d u a l ) + T [ 0 ] . d u a l
+41 /LbagT[1].real = 334.7 + -58.84/u1D7161 + 0.99/u1D7163 + -0.13/u1D7165 + -0.33/u1D7167 + -0.81/u1D7168 + -0.96/u1D71610 + -0.015/u1D71612 + 0.36/u1D71613,
+42 /u1D459/u1D447[1]./u1D45F/u1D452/u1D44E/u1D459= 272. 25,/u1D462/u1D447[1]./u1D45F/u1D452/u1D44E/u1D459= 397. 15/Rbag
+43 /LbagT[1].dual = 0.94 + 0.03/u1D7161 + -2.01e-5/u1D7163 + -0.004/u1D7165 + 6.88e-6/u1D7167 + 1.64e-5/u1D7168 + -0.003/u1D7169 + 1.95e-5/u1D71610 + -0.02/u1D71611 + 0.002/u1D71614,
+44 /u1D459/u1D447[1]./u1D451/u1D462/u1D44E/u1D459= 0. 8767,/u1D462/u1D447[1]./u1D45F/u1D452/u1D44E/u1D459= 0. 9760/Rbag
+Fig. 2. Abstractly Interpreted AD source code for diﬀerentiating a single iteration of ODESolve/u1D453
+can directly bene/f_it from having these re/f_ined bounds which directly leads to more precise aﬃne
+forms. In contrast, as noted in [ Turner 2020], the standard zonotope transformers for multiplication
+cannot take advantage of the re/f_ined bounds to improve precision of the resulting aﬃne form.
+Synthesized Abstraction for Product Rule. Pasado’s next step is to compute the product in line
+24, as well as the derivative using the product rule in line 26. As mentioned, Pasado is focused solely
+on developing precise abstractions for the derivatives, hence the multiplication of the real parts in
+line 24 uses the standard interval and zonotope domain multiplications. Similarly to the chain rule,
+our synthesized abstract transformer will solve a linear regression problem for new/u1D434,/u1D435,/u1D436,/u1D437,/u1D438∈ R
+such that in the region[/u1D459/u1D452./u1D45F/u1D452/u1D44E/u1D459,/u1D462/u1D45F/u1D452/u1D44E/u1D459]×[ /u1D459/u1D452./u1D451/u1D462/u1D44E/u1D459,/u1D462/u1D452./u1D451/u1D462/u1D44E/u1D459]×[ /u1D459/u1D4561./u1D45F/u1D452/u1D44E/u1D459,/u1D462/u1D4561./u1D45F/u1D452/u1D44E/u1D459]×[ /u1D459/u1D4561./u1D451/u1D462/u1D44E/u1D459,/u1D462/u1D4561./u1D451/u1D462/u1D44E/u1D459]:
+/u1D434·(/u1D452./u1D45F/u1D452/u1D44E/u1D459)+ /u1D435·(/u1D452./u1D451/u1D462/u1D44E/u1D459)+ /u1D436·(/u1D4561./u1D45F/u1D452/u1D44E/u1D459)+ /u1D437·(/u1D4561./u1D451/u1D462/u1D44E/u1D459)+ /u1D438≈/u1D452./u1D45F/u1D452/u1D44E/u1D459·/u1D4561./u1D451/u1D462/u1D44E/u1D459+/u1D452./u1D451/u1D462/u1D44E/u1D459·/u1D4561./u1D45F/u1D452/u1D44E/u1D459
+Hence the resulting aﬃne form is /hat5/u1D4562./u1D451/u1D462/u1D44E/u1D459=/u1D434( /hat4/u1D452./u1D45F/u1D452/u1D44E/u1D459)+ /u1D435(/hat5/u1D452./u1D451/u1D462/u1D44E/u1D459)+/u1D436(/hat5/u1D4561./u1D45F/u1D452/u1D44E/u1D459)+ /u1D437( /hat5/u1D4561./u1D451/u1D462/u1D44E/u1D459)+ /u1D438+
+/u1D439/u1D716/u1D45B/u1D452/u1D464In this example, the linear regression /f_inds the new coeﬃcients should be/u1D434= 0,/u1D435=−6·10−24,
+/u1D436= 3· 10−24,/u1D437= 4. 25· 10−8 and/u1D438=−5· 10−14. Our abstraction must also solve for the maximum
+Proc. ACM Program. Lang., Vol. 7, No. OOPSLA2, Article 291. Publication date: October 2023.
+Synthesizing Precise Static Analyzers for Automatic Diﬀerentiation 291:9
+error/u1D439. Among our key contributions is proving that for the product rule, this error can be obtained
+by just enumerating the 24 corner points. Hence we compute /u1D439as:
+max
+(/u1D4651,/u1D466.alt1,/u1D4652,/u1D466.alt2)∈
+{/u1D459/u1D452./u1D45F/u1D452/u1D44E/u1D459,/u1D462/u1D452./u1D45F/u1D452/u1D44E/u1D459}×{/u1D459/u1D452./u1D451/u1D462/u1D44E/u1D459,/u1D462/u1D452./u1D451/u1D462/u1D44E/u1D459}×{/u1D459/u1D4561./u1D45F/u1D452/u1D44E/u1D459,/u1D462/u1D4561./u1D45F/u1D452/u1D44E/u1D459}×{/u1D459/u1D4561./u1D451/u1D462/u1D44E/u1D459,/u1D462/u1D4561/u1D451/u1D462/u1D44E/u1D459}
+|(/u1D4651·/u1D466.alt2)+(/u1D4652·/u1D466.alt1)−(/u1D434/u1D4651+/u1D435/u1D466.alt1+/u1D436/u1D4652+/u1D437/u1D466.alt2+/u1D438)|
+In this example, /u1D439= 2. 17. While our example has two multiplications on line 26, Pasado introduces
+only a single noise symbol(/u1D439/u1D716/u1D45B/u1D452/u1D464) instead of two as the standard zonotope multiplication would.
+Furthermore, we can solve a simpler version of the previous optimization problem for direct interval
+lower and upper bounds using the same approach (enumerating over the corners) and then take
+the intersection of those with the bounding box of the aﬃne form. Performing this procedure
+ultimately gives us/u1D4562./u1D451/u1D462/u1D44E/u1D459’s re/f_ined bounds of[2. 83, 13. 06] as shown on line 27.
+Synthesized Abstraction for Quotient Rule. Upon computing the products, computing the
+aﬃne transformations on line 29 is straightforward. Hence the abstract interpreter next proceeds to
+line 33 to compute the quotient. The derivative is computed via quotient rule on line 36. As before,
+Pasado uses linear regression to solve for coeﬃcients /u1D434,/u1D435,/u1D436,/u1D437,/u1D438∈ R such that
+/u1D434·(/u1D4563./u1D45F/u1D452/u1D44E/u1D459)+ /u1D435·(/u1D4563./u1D451/u1D462/u1D44E/u1D459)+ /u1D436·(/u1D445./u1D45F/u1D452/u1D44E/u1D459)+ /u1D437·(/u1D445./u1D451/u1D462/u1D44E/u1D459)+ /u1D438≈(/u1D445./u1D45F/u1D452/u1D44E/u1D459·/u1D4563./u1D451/u1D462/u1D44E/u1D459)−( /u1D4563./u1D45F/u1D452/u1D44E/u1D459·/u1D445./u1D451/u1D462/u1D44E/u1D459)
+/u1D445./u1D45F/u1D452/u1D44E/u1D4592
+Here the values are /u1D434= -4. 2· 10−6,/u1D435= 0. 35,/u1D436= 1. 01,/u1D437= 6. 5· 10−6, and /u1D438= -2. 84, where
+the resulting aﬃne form is /hat5/u1D4564./u1D451/u1D462/u1D44E/u1D459=/u1D434/hat6(/u1D4563./u1D45F/u1D452/u1D44E/u1D459)+ /u1D435/hat6(/u1D4563./u1D451/u1D462/u1D44E/u1D459)+ /u1D436/hat6(/u1D445./u1D45F/u1D452/u1D44E/u1D459)+ /u1D437/hat6(/u1D445./u1D451/u1D462/u1D44E/u1D459)+ /u1D438+/u1D439/u1D716/u1D45B/u1D452/u1D464.
+Solving for the maximum error, /u1D439, is more involved, as we must solve:
+max
+/u1D4651∈[/u1D459/u1D4563./u1D45F/u1D452/u1D44E/u1D459,/u1D462/u1D4563./u1D45F/u1D452/u1D44E/u1D459],/u1D466.alt1∈[/u1D459/u1D4563./u1D451/u1D462/u1D44E/u1D459,/u1D462/u1D4563./u1D451/u1D462/u1D44E/u1D459]
+/u1D4652∈[/u1D459/u1D445./u1D45F/u1D452/u1D44E/u1D459,/u1D462/u1D445./u1D45F/u1D452/u1D44E/u1D459],/u1D466.alt2∈[/u1D459/u1D445./u1D451/u1D462/u1D44E/u1D459,/u1D462/u1D445./u1D451/u1D462/u1D44E/u1D459]
+|(/u1D4652·/u1D466.alt1)−( /u1D4651·/u1D466.alt2)
+/u1D4652
+2
+−(/u1D434/u1D4651+/u1D435/u1D466.alt1+/u1D436/u1D4652+/u1D437/u1D466.alt2+/u1D438)|
+The solution to this optimization requires Pasado to solve for roots of a cubic equation, as we will
+see. However, Pasado can likewise use that same technique to directly solve for optimal interval
+bounds: min(/u1D4652·/u1D466.alt1)−(/u1D4651·/u1D466.alt2)
+/u1D4652
+2
+and max(/u1D4652·/u1D466.alt1)−(/u1D4651·/u1D466.alt2)
+/u1D4652
+2
+over the same 4D region as above. We ultimately
+obtain the aﬃne form shown in line 43 and the re/f_ined bounds[0. 8767, 0. 9760] in line 44.
+Results. Abstractly interpreting the computation using Pasado’s synthesized transformers oﬀers
+notable precision gains over standard interval and zonotope abstract transformers. As mentioned,
+Pasado’s bounds on the derivative after one iteration are:[0. 8767, 0. 9760], whereas, the respective
+1 2 3 4 5 6 7 8 9 10 11 12
+Time Step
+−0.50
+−0.25
+0.00
+0.25
+0.50
+0.75
+1.00
+Sensitivity
+Interval
+Zonotope
+Pasado
+Scalar
+Fig. 3. Comparison of Pasado with in-
+terval and zonotope abstract AD for
+bounding derivative-based sensitivi-
+ties with respect to /u1D4470 for 12 full iter-
+ations of ODESolve/u1D453. Each region be-
+tween line segments of the same color
+represents the interval bound com-
+puted by that respective method’s
+corresponding abstract AD. The dots
+represent the sensitivities evaluated
+concretely, using scalar points sam-
+pled from the input intervals.
+Proc. ACM Program. Lang., Vol. 7, No. OOPSLA2, Article 291. Publication date: October 2023.
+291:10 Jacob Laurel, Siyuan Brant Qian, Gagandeep Singh, Sasa Misailovic
+bounds computed with intervals are [0. 862, 0. 978] and with zonotopes are[0. 868, 1. 013]. While
+Figs. 1 and 2 show only a single iteration, the bene/f_its of Pasado compound over multiple iterations.
+Fig. 3 shows the bounds computed for up to /u1D441= 12 iterations by both Pasado and the interval
+and zonotope AD baselines. This plot shows how Pasado’s improvement compounds, and how after
+12 iterations (full code not shown), Pasado’s derivative bounds stay provably positive, and thus can
+prove monotonicity with respect to /u1D4470, whereas interval and zonotope abstract AD cannot.
+3 PRELIMINARIES
+We now detail the necessary preliminaries for describing both automatic diﬀerentiation as well as
+abstract interpretation. We also detail some of the key mathematical requirements for Pasado.
+3.1 Automatic Diﬀerentiation Implementation
+Forward-Mode AD. In forward-mode AD, one computes both the primal (the original program)
+as well as the tangent derivatives simultaneously in a single forward pass. For functions /u1D453: R/u1D45A→
+R/u1D45B, computing the full Jacobian via forward mode requires /u1D45Apasses, hence forward mode is
+more eﬃcient when /u1D45A< /u1D45B. Since the computation of both the original primal program and the
+derivatives are interwoven into a single forward pass and thus happens simultaneously, one must
+designate separate variables for the primal (the real part) and the associated derivatives (the dual
+part). This separation of variables into disjoint sets is canonically implemented with dual numbers
+[Griewank and Walther 2008], where the real component of the dual number encodes the variables
+of the primal, and the dual component of the dual number encodes the associated derivatives.
+The standard rules of calculus – chain rule, product rule and quotient rule can be encoded by
+overloading the respective arithmetic operation for dual numbers. For a given variable /u1D465, we will
+denote the real part as /u1D465./u1D45F/u1D452/u1D44E/u1D459and the dual part storing the associated derivative as /u1D465./u1D451/u1D462/u1D44E/u1D459.
+Reverse-Mode AD. In reverse mode AD, one /f_irst computes the primal and then back-propagates
+the derivatives from the output variable back to the input variables [ Griewank and Walther 2008].
+For functions /u1D453: R/u1D45A→ R/u1D45B, computing the full Jacobian via reverse mode requires /u1D45Bpasses, hence
+reverse mode is more eﬃcient when /u1D45A> /u1D45B. Unlike with forward-mode AD, in reverse-mode AD
+the original program (the primal) is computed in its entirety before even a single derivative is
+computed. However, one still needs a separate set of variables to store the derivatives. Following
+convention, we will simply let /u1D465denote a given variable in the primal and /u1D465denote the adjoint
+derivative for/u1D465that is computed in the backward pass.
+3.2 Abstract Interpretation
+We now describe the necessary preliminaries of Abstract Interpretation. Abstract Interpretation
+[Cousot and Cousot 1977 ] is a framework for soundly over-approximating the set of possible
+executions of a program. For Pasado’s analysis, we require the following:
+(1) A numerical abstract domain, A which may be either Intervals or any abstract domain that can
+represent linear transformations exactly (e.g. Zonotopes, Quadratic Zonotopes, Polyhedra).
+A can also be a reduced product of those aforementioned domains.
+(2) A concretization function /u1D6FE: A→P( R/u1D45B) that maps an abstract element in the Abstract
+Domain to sets of AD program states (which are just tuples of /u1D45Breal numbers.).
+(3) A bounding box function /u1D445/u1D44E/u1D45B/u1D454/u1D452: A→ R/u1D45B× R/u1D45Bthat takes an abstract element describing
+sets of AD program states of /u1D45Bvariables and returns the bounds on each variable.
+(4) Sound abstract transformers,/u1D447♯
+/u1D453: A→ A, for each univariate nonlinear function /u1D453: R→ R.
+The functions we consider are{log(/u1D465), exp(/u1D465),√/u1D465,/u1D4652,/u1D4653,/u1D4654, tanh(/u1D465),/u1D70E(/u1D465), NormalCDF(/u1D465)} .
+Proc. ACM Program. Lang., Vol. 7, No. OOPSLA2, Article 291. Publication date: October 2023.
+Synthesizing Precise Static Analyzers for Automatic Diﬀerentiation 291:11
+(5) Sound abstract transformers, /u1D447♯
+/u1D45C/u1D45D: A→ A, for each binary operation /u1D45C/u1D45D∈{+,−,∗,/}.
+Additionally, unique to our approach is that we will also require a guaranteed root solver for the
+second derivative of each nonlinear function /u1D453listed in (4), so that we can solve for all/u1D465∗∈[ /u1D459,/u1D462] (or
+certify that none exist inside[/u1D459,/u1D462]) such that /u1D453′′(/u1D465∗) =/u1D436for any given/u1D436. For this root-solving, one
+may use a veri/f_ied root /f_inding technique like Bisection or a veri/f_ied Newton’s method, however for
+many of the functions such that /u1D453′′−1 has an analytical formula, we can use the analytical formula
+to solve for/u1D465∗ directly. For instance when /u1D453(/u1D465) = exp(/u1D465), we know /u1D453′′−1(/u1D465) = log(/u1D465).
+For our purposes we will use the reduced product of the Zonotope domain with the Interval
+domain as this combination is essentially a (restricted) polyhedral domain that is more expressive
+than standard zonotopes, however as described in Theorem4.5, our construction would equally work
+for other domains which can symbolically express linear relationships exactly such as quadratic
+zonotopes, or the DeepPoly domain.
+For our purposes an abstract state /u1D44E∈ A will map each variable /u1D465/u1D456to both an aﬃne form,
+/u1D44E[/u1D465/u1D456]. ˆ/u1D465/u1D456= /u1D465/u1D4560+ /summationtext.1
+/u1D457/u1D450/u1D457/u1D716/u1D457and an interval /u1D44E[/u1D465/u1D456].[/u1D459/u1D465/u1D456,/u1D462/u1D465/u1D456]. The bounding box function returns the
+intersection of the associated interval with the bound on the aﬃne form, hence /u1D445/u1D44E/u1D45B/u1D454/u1D452(/u1D44E[/u1D465/u1D456]) =
+[/u1D465/u1D4560−/summationtext.1
+/u1D457|/u1D450/u1D457|,/u1D465/u1D4560+/summationtext.1
+/u1D457|/u1D450/u1D457|]⊓ /u1D44E[/u1D465/u1D456].[/u1D459/u1D465/u1D456,/u1D462/u1D465/u1D456]. Since we take the reduced product, our concretization
+function uses both the standard interval and zonotope concretization functions /u1D6FE/u1D43C/u1D45B/u1D461,/u1D6FE/u1D44D/u1D45C/u1D45B/u1D45C[Ghorbal
+et al. 2009 ] and is given as:
+/u1D6FE(/u1D44E) =
+{
+(/u1D4651,...,/u1D465 /u1D45B)∈ R/u1D45B:(/u1D4651,...,/u1D465 /u1D45B)∈ /u1D6FE/u1D44D/u1D45C/u1D45B/u1D45C
+(/u1D45B/logicalanddisplay.1
+/u1D457=1
+/u1D44E[/u1D465/u1D457]. ˆ/u1D465/u1D457
+)
+∩/u1D6FE/u1D43C/u1D45B/u1D461
+(/u1D45A/logicalanddisplay.1
+/u1D457=1
+/u1D44E[/u1D465/u1D457].[/u1D459/u1D465/u1D457,/u1D462/u1D465/u1D457]
+)}
+As mentioned in Section 2, for analyzing the real (non-derivative) part of the program we will
+use the given domain’s standard abstract transformers required in ( 4) and (5) hence Pasado only
+focuses on synthesizing abstractions for the derivative terms to improve precision. Further, since
+addition can already be done exactly with zonotopes, Pasado will use the standard transformers for
+addition, even in the derivative computations.
+4 SYNTHESIZING PRECISE STATIC ANALYZERS
+We now present Pasado, our technique for synthesizing precise abstract transformers, specialized
+for AD. Pasado’s technique allows us to synthesize precise abstract transformers for the Chain Rule,
+Product Rule and Quotient Rule of Calculus, which we will denote /u1D447♯
+/u1D436/u1D453
+,/u1D447♯
+/u1D443,/u1D447♯
+/u1D444: A→ A. Pasado
+will use standard abstract transformers (e.g., /u1D447♯
+/u1D453,/u1D447♯
+/u1D45C/u1D45Drequired in Section 3.2) to abstract the primal
+computation and/u1D447♯
+/u1D436/u1D453
+,/u1D447♯
+/u1D443,/u1D447♯
+/u1D444to abstract the derivative computation.
+Since both forward-mode AD and reverse-mode AD ultimately use these same rules, we can
+synthesize precise abstractions for each of the core operations for either mode of AD. The only
+diﬀerence between AD modes is the order of application, for instance in forward mode for /u1D44E∈ A,
+the application order would be /u1D447♯
+/u1D443(/u1D447♯
+∗(/u1D447♯
+/u1D436/u1D453
+(/u1D447♯
+/u1D453(/u1D44E)))) whereas for reverse mode the order would be
+/u1D447♯
+/u1D443(/u1D447♯
+/u1D436/u1D453
+(/u1D447♯
+∗(/u1D447♯
+/u1D453(/u1D44E)))) as the entire primal must be abstracted before any derivatives can be. While
+there are other rules of calculus, like the generalized power rule, for which our techniques are
+inapplicable (due to diﬀerences in the Hessian behavior), these three rules comprise the majority of
+nonlinear AD operations and thus are the most important.
+Pasado’s abstract transformer synthesis involves a combination of linear regression at uniformly
+spaced points and solving a nonlinear optimization problem to ensure soundness. For tractability,
+we limit the number of sampled grid points used in the linear regression (which trades oﬀ precision).
+Proc. ACM Program. Lang., Vol. 7, No. OOPSLA2, Article 291. Publication date: October 2023.
+291:12 Jacob Laurel, Siyuan Brant Qian, Gagandeep Singh, Sasa Misailovic
+(a)
+ (b)
+ (c)
+Fig. 4. Visualization of Pasado’s abstract transformer synthesis for the Chain rule pa/t_tern /u1D454(/u1D465,/u1D466.alt) =/u1D70E(/u1D465)·
+(1−/u1D70E(/u1D465))· /u1D466.alton[−1, 1]×[− 1, 1]. In (a), the blue surface represents/u1D454(/u1D465,/u1D466.alt). In (b), the blue dots on the blue
+surface represent evaluations of /u1D454(/u1D465,/u1D466.alt) at grid sampled points. The yellow hyperplane in (b) is computed by
+performing linear regression with these blue points and has equation /u1D434/u1D465+/u1D435/u1D466.alt+/u1D436. In (c), the red lines show
+the diﬀerence between /u1D454(/u1D465,/u1D466.alt) and the plane and /u1D437represents the maximum such diﬀerence. The lower and
+upper orange planes in (c) are the enclosing linear bounds given by /u1D434/u1D465+/u1D435/u1D466.alt+/u1D436±/u1D437. The enclosing bounds
+are parallel for the Zonotope domain and here the maximum diﬀerence /u1D437occurs at a corner point.
+4.1 Chain Rule Synthesized Transformer
+The /f_irst rule of Calculus for which we want to synthesize a precise abstraction is the Chain Rule.
+For functions /u1D453,/u1D454: R→ R, the chain rule is mathematically given as:
+/u1D453(/u1D454(/u1D462))′ = /u1D453′(/u1D454(/u1D462))· /u1D454′(/u1D462)
+Forward-Mode Chain Rule. In forward-mode AD this rule is implemented via:
+/u1D467./u1D45F/u1D452/u1D44E/u1D459= /u1D453(/u1D465./u1D45F/u1D452/u1D44E/u1D459);
+/u1D467./u1D451/u1D462/u1D44E/u1D459= /u1D453′(/u1D465./u1D45F/u1D452/u1D44E/u1D459)· /u1D465./u1D451/u1D462/u1D44E/u1D459;
+where intuitively,/u1D465./u1D45F/u1D452/u1D44E/u1D459=/u1D454(/u1D462),/u1D465./u1D451/u1D462/u1D44E/u1D459=/u1D454′(/u1D462),/u1D467./u1D45F/u1D452/u1D44E/u1D459= /u1D453(/u1D454(/u1D462)) , and/u1D467./u1D451/u1D462/u1D44E/u1D459= /u1D453(/u1D454(/u1D462))′.
+Reverse-Mode Chain Rule. Likewise in reverse-mode AD, this rule is implemented as:
+/u1D467= /u1D453(/u1D465); ...
+/u1D467=...
+/u1D465+=/u1D453′(/u1D465)· /u1D467;
+where the "... " at the end of the /f_irst line represents the break between the end of the primal part
+of the diﬀerentiable program and the start of the adjoint part of the same diﬀerentiable program,
+which computes all the derivatives (e.g. /u1D467,/u1D465).
+Chain Rule Abstraction Pattern. Based on these implementations, the main expression, present
+in both forward and reverse AD, for which we want to synthesize an abstract transformer,/u1D447♯
+/u1D436/u1D453
+, is:
+/u1D454(/u1D465,/u1D466.alt) = /u1D453′(/u1D465)· /u1D466.alt
+The bene/f_it of synthesizing an abstraction for this chain rule pattern is that this pattern could
+have multiple nonlinear operations. For instance, if /u1D453(/u1D465) =/u1D70E(/u1D465), then /u1D453′(/u1D465) =/u1D70E(/u1D465)·( 1−/u1D70E(/u1D465)),
+which has a nonlinear multiplication, in addition to the nonlinear multiplication with /u1D466.alt. Thus
+naively composing the abstract transformers for each nonlinear operation e.g., /u1D447♯
+∗(/u1D447♯
+∗(/u1D447♯
+−(/u1D447♯
+/u1D70E(/u1D44E))))
+as in Laurel et al. [2022b] can lead to imprecision. Particularly when using zonotopes, each of those
+nonlinear operations introduces a new noise symbol which adds additional over-approximation. In
+contrast,/u1D447♯
+/u1D436/u1D453
+introduces only a single noise symbol for the entire chain rule derivative expression.
+Abstraction. We now present how to abstract the chain rule pattern. Algorithm 1 presents
+the abstract transformer/u1D447♯
+/u1D436/u1D453
+and Fig. 4 presents a geometric intuition. The core idea is to sample
+Proc. ACM Program. Lang., Vol. 7, No. OOPSLA2, Article 291. Publication date: October 2023.
+Synthesizing Precise Static Analyzers for Automatic Diﬀerentiation 291:13
+Algorithm 1 Chain Rule Abstract Transformer/u1D447♯
+/u1D436/u1D453
+Input: Abstract state/u1D44Ewhere ˆ/u1D465=/u1D44E[/u1D465]. ˆ/u1D465and ˆ/u1D466.alt=/u1D44E[/u1D466.alt]. ˆ/u1D466.alt
+/u1D459/u1D465,/u1D462/u1D465←/u1D445/u1D44E/u1D45B/u1D454/u1D452(/u1D44E[/u1D465])
+/u1D459/u1D466.alt,/u1D462/u1D466.alt←/u1D445/u1D44E/u1D45B/u1D454/u1D452(/u1D44E[/u1D466.alt])
+/u1D454/u1D45F/u1D456/u1D451←/u1D43A/u1D45F/u1D456/u1D451/u1D446/u1D44E/u1D45A/u1D45D/u1D459/u1D452([/u1D459/u1D465,/u1D462/u1D465]×[ /u1D459/u1D466.alt,/u1D462/u1D466.alt])
+/u1D45D/u1D461/u1D460←{ /u1D453′(/u1D465)· /u1D466.alt:(/u1D465,/u1D466.alt)∈ /u1D454/u1D45F/u1D456/u1D451}
+/u1D434,/u1D435,/u1D436←/u1D43F/u1D456/u1D45B/u1D452/u1D44E/u1D45F/u1D445/u1D452/u1D454/u1D45F/u1D452/u1D460/u1D460/u1D456/u1D45C/u1D45B(/u1D454/u1D45F/u1D456/u1D451,/u1D45D/u1D461/u1D460)
+if/u1D434= 0 then/u1D434←/u1D434+/u1D6FF
+/u1D437← max
+/u1D465∈[/u1D459/u1D465,/u1D462/u1D465],/u1D466.alt∈[/u1D459/u1D466.alt,/u1D462/u1D466.alt]
+|/u1D453′(/u1D465)· /u1D466.alt−(/u1D434/u1D465+/u1D435/u1D466.alt+/u1D436)|
+/u1D459,/u1D462← min
+/u1D465∈[/u1D459/u1D465,/u1D462/u1D465],/u1D466.alt∈[/u1D459/u1D466.alt,/u1D462/u1D466.alt]
+/u1D453′(/u1D465)· /u1D466.alt, max
+/u1D465∈[/u1D459/u1D465,/u1D462/u1D465],/u1D466.alt∈[/u1D459/u1D466.alt,/u1D462/u1D466.alt]
+/u1D453′(/u1D465)· /u1D466.alt
+return /u1D434ˆ/u1D465+/u1D435ˆ/u1D466.alt+/u1D436+/u1D437/u1D716/u1D45B/u1D452/u1D464, [/u1D459,/u1D462]
+uniformly spaced points that lie within the range of the input intervals and then solve a linear
+regression problem to /f_ind the best linear approximation of/u1D453′(/u1D465)· /u1D466.altat those points. However, the
+most critical step for proving soundness is solving a challenging multidimensional, nonconvex
+optimization problem, to soundly enclose the linear approximation, which we now describe.
+Optimization Problem. The core technical diﬃculty of the Chain Rule abstract transformer lies
+in solving the following equation for the maximum deviation between the linear approximation
+(/u1D434/u1D465+/u1D435/u1D466.alt+/u1D436) and the function /u1D453′(/u1D465)· /u1D466.altitself (example shown in Fig. 4). This maximum deviation
+is needed to obtain the tightest enclosure around the linear approximation (/u1D434/u1D465+/u1D435/u1D466.alt+/u1D436) such that
+this enclosure still provably contains the range of /u1D453′(/u1D465)· /u1D466.alt. This deviation /u1D437is computed as:
+/u1D437= max
+/u1D465∈[/u1D459/u1D465,/u1D462/u1D465],/u1D466.alt∈[/u1D459/u1D466.alt,/u1D462/u1D466.alt]
+|/u1D453′(/u1D465)· /u1D466.alt−(/u1D434/u1D465+/u1D435/u1D466.alt+/u1D436)| (3)
+Pasado reduces this multivariate, non-convex optimization problem into two simpler univariate
+problems as well as simply checking the four corner points: {/u1D459/u1D465,/u1D462/u1D465}×{ /u1D459/u1D466.alt,/u1D462/u1D466.alt} (we provide a full
+explanation in Section 4.4). For the correctness of our proof which is subsequently shown in
+Theorem 4.1, it is a technical requirement that /u1D434≠ 0. If linear regression obtains /u1D434= 0, we perturb
+/u1D434by a small quantity,/u1D6FF< 10−9. To solve the two univariate optimization problems, we compute
+all/u1D465∗∈[ /u1D459/u1D465,/u1D462/u1D465] such that /u1D453′′(/u1D465∗) = /u1D434
+/u1D459/u1D466.alt
+and all/u1D465∗∗∈[ /u1D459/u1D465,/u1D462/u1D465] such that /u1D453′′(/u1D465∗∗) = /u1D434
+/u1D462/u1D466.alt
+. Thus we must
+also examine the points(/u1D465∗,/u1D459/u1D466.alt) and(/u1D465∗∗,/u1D462/u1D466.alt). We can solve for all /u1D465∗ and/u1D465∗∗ using the guaranteed
+root solver that we required in Section 3.2. Hence the optimization problem ultimately reduces to:
+/u1D437= max
+(/u1D465,/u1D466.alt)∈
+(
+{/u1D459/u1D4651,/u1D462/u1D4651}×{/u1D459/u1D466.alt1,/u1D462/u1D466.alt1}
+)
+∪{(/u1D465∗,/u1D459/u1D466.alt),(/u1D465∗∗,/u1D462/u1D466.alt)}
+|/u1D453′(/u1D465)· /u1D466.alt−(/u1D434/u1D465+/u1D435/u1D466.alt+/u1D436)|
+While inspired by Ryou et al. [2021], our proof technique is more general as we can handle any
+/u1D453satisfying the properties of Section 3.2. The generality of our approach also stems from expanding
+this proof technique to other patterns arising from AD. We also show how to adapt this proof to
+obtain precise interval domain transformers. Indeed, the key bene/f_it is that we can use virtually
+the same proof to get the exact lower and upper bounds of /u1D453′(/u1D465)· /u1D466.altfor the given input intervals.
+Hence we can compute optimal lower and upper bounds, /u1D459and/u1D462, as follows:
+/u1D459= min
+(/u1D465,/u1D466.alt)∈
+(
+{/u1D459/u1D4651,/u1D462/u1D4651}×{/u1D459/u1D466.alt1,/u1D462/u1D466.alt1}
+)
+∪{(/u1D465∗,/u1D459/u1D466.alt),(/u1D465∗∗,/u1D462/u1D466.alt)}
+/u1D453′(/u1D465)· /u1D466.alt (4)
+/u1D462= max
+(/u1D465,/u1D466.alt)∈
+(
+{/u1D459/u1D4651,/u1D462/u1D4651}×{/u1D459/u1D466.alt1,/u1D462/u1D466.alt1}
+)
+∪{(/u1D465∗,/u1D459/u1D466.alt),(/u1D465∗∗,/u1D462/u1D466.alt)}
+/u1D453′(/u1D465)· /u1D466.alt (5)
+Proc. ACM Program. Lang., Vol. 7, No. OOPSLA2, Article 291. Publication date: October 2023.
+291:14 Jacob Laurel, Siyuan Brant Qian, Gagandeep Singh, Sasa Misailovic
+The core bene/f_it of having both zonotope aﬃne forms and separately computed interval lower
+and upper bounds is that not only does the same proof strategy give us sound abstractions for both
+domains, but by taking their reduced product, we can always use the interval results to re/f_ine the
+zonotope, as in Singh et al. [2019c] to enhance precision.
+4.2 Product Rule Synthesized Transformer
+The next rule of calculus for which we wish to synthesize a precise abstract transformer, /u1D447♯
+/u1D443is the
+Product Rule. For functions /u1D453,/u1D454: R→ R, the product rule is mathematically given as:
+(/u1D453(/u1D462)· /u1D454(/u1D462))′ = /u1D453′(/u1D462)· /u1D454(/u1D462)+ /u1D453(/u1D462)· /u1D454′(/u1D462)
+Forward-Mode Product Rule. In forward-mode AD, the product rule is implemented via:
+/u1D467./u1D45F/u1D452/u1D44E/u1D459=/u1D465./u1D45F/u1D452/u1D44E/u1D459·/u1D466.alt./u1D45F/u1D452/u1D44E/u1D459;
+/u1D467./u1D451/u1D462/u1D44E/u1D459=(/u1D465./u1D451/u1D462/u1D44E/u1D459·/u1D466.alt./u1D45F/u1D452/u1D44E/u1D459)+( /u1D465./u1D45F/u1D452/u1D44E/u1D459·/u1D466.alt./u1D451/u1D462/u1D44E/u1D459);
+where intuitively, /u1D465./u1D45F/u1D452/u1D44E/u1D459= /u1D453(/u1D462),/u1D466.alt./u1D45F/u1D452/u1D44E/u1D459= /u1D454(/u1D462), /u1D465./u1D451/u1D462/u1D44E/u1D459= /u1D453′(/u1D462), and /u1D466.alt./u1D451/u1D462/u1D44E/u1D459= /u1D454′(/u1D462). It is
+important to note that the computation of /u1D467./u1D451/u1D462/u1D44E/u1D459involves 2 nonlinear multiplications.
+Reverse-Mode Product Rule. Similarly, in reverse-mode AD, the product rule is encoded as:
+/u1D467=/u1D465·/u1D466.alt; ...
+/u1D467=...
+/u1D465+=/u1D466.alt·/u1D467;
+/u1D466.alt+=/u1D465·/u1D467;
+Product Rule Abstraction Pattern. Based on the product rule implementations shown above,
+the computational pattern for which we want to synthesize an abstraction is:
+/u1D454(/u1D4651,/u1D466.alt1,/u1D4652,/u1D466.alt2) =(/u1D4651·/u1D466.alt2)+( /u1D4652·/u1D466.alt1)
+In the event that some of the arguments are zero, this pattern could involve a single multiplication.
+Conversely, when all arguments are nonzero, this pattern entails two nonlinear multiplications. In
+particular, the instantiation of this abstraction for reverse-mode AD can be seen as a special case
+whereby we set the /f_irst argument/u1D4651 to 0.
+Abstraction. We now present Pasado’s synthesis technique for the product rule abstract trans-
+former,/u1D447♯
+/u1D443in Algorithm 2. As with the chain rule pattern, we synthesize the coeﬃcients by solving
+a linear regression, and a tractable, but nonconvex optimization problem.
+There is another key bene/f_it to Pasado’s product rule abstract transformer. The standard zonotope
+multiplication operates directly on the coeﬃcients of the input aﬃne forms. As a result, the standard
+abstract transformer cannot leverage tighter ranges on the inputs, as these ranges are never taken
+into account. Thus, when performing the two multiplications of the product rule with regular
+zonotopes, the ability to leverage improved precision from a reduced product is limited. In contrast,
+since Pasado’s synthesized abstraction directly incorporates the bounds on the input, Pasado can
+immediately bene/f_it from the improved precision that a reduced product with intervals oﬀers.
+Optimization Problem. For the product rule abstraction, we must solve the following 4D
+nonlinear, nonconvex optimization problem:
+/u1D439= max
+/u1D4651∈[/u1D459/u1D4651,/u1D462/u1D4651],/u1D466.alt1∈[/u1D459/u1D466.alt1,/u1D462/u1D466.alt1]
+/u1D4652∈[/u1D459/u1D4652,/u1D462/u1D4652],/u1D466.alt2∈[/u1D459/u1D466.alt2,/u1D462/u1D466.alt2]
+|(/u1D4651·/u1D466.alt2)+( /u1D4652·/u1D466.alt1)−( /u1D434/u1D4651+/u1D435/u1D466.alt1+/u1D436/u1D4652+/u1D437/u1D466.alt2+/u1D438)| (6)
+The bene/f_it of this optimization problem is that we only need to check the 24 corner points, i.e.,
+{/u1D459/u1D4651,/u1D462/u1D4651}×{ /u1D459/u1D466.alt1,/u1D462/u1D466.alt1}×{ /u1D459/u1D4652,/u1D462/u1D4652}×{ /u1D459/u1D466.alt2,/u1D462/u1D466.alt2}, hence the optimization problem of Eq. 6 reduces to:
+Proc. ACM Program. Lang., Vol. 7, No. OOPSLA2, Article 291. Publication date: October 2023.
+Synthesizing Precise Static Analyzers for Automatic Diﬀerentiation 291:15
+Algorithm 2 Product Rule Abstract Transformer/u1D447♯
+/u1D443
+Input: Abstract state/u1D44Ewhere ˆ/u1D4651 =/u1D44E[/u1D4651]. ˆ/u1D4651, ˆ/u1D466.alt1 =/u1D44E[/u1D466.alt1]. ˆ/u1D466.alt1, ˆ/u1D4652 =/u1D44E[/u1D4652]. ˆ/u1D4652, and ˆ/u1D466.alt2 =/u1D44E[/u1D466.alt2]. ˆ/u1D466.alt2
+/u1D459/u1D4651,/u1D462/u1D4651←/u1D445/u1D44E/u1D45B/u1D454/u1D452(/u1D44E[/u1D4651]) and /u1D459/u1D466.alt1,/u1D462/u1D466.alt1←/u1D445/u1D44E/u1D45B/u1D454/u1D452(/u1D44E[/u1D466.alt1])
+/u1D459/u1D4652,/u1D462/u1D4652←/u1D445/u1D44E/u1D45B/u1D454/u1D452(/u1D44E[/u1D4652]) and /u1D459/u1D466.alt2,/u1D462/u1D466.alt2←/u1D445/u1D44E/u1D45B/u1D454/u1D452(/u1D44E[/u1D466.alt2])
+/u1D454/u1D45F/u1D456/u1D451←/u1D43A/u1D45F/u1D456/u1D451/u1D446/u1D44E/u1D45A/u1D45D/u1D459/u1D452([/u1D459/u1D4651,/u1D462/u1D4651]×[ /u1D459/u1D466.alt1,/u1D462/u1D466.alt1]×[ /u1D459/u1D4652,/u1D462/u1D4652]×[ /u1D459/u1D466.alt2,/u1D462/u1D466.alt2])
+/u1D45D/u1D461/u1D460←{( /u1D4651·/u1D466.alt2)+( /u1D4652·/u1D466.alt1) :(/u1D4651,/u1D466.alt1,/u1D4652,/u1D466.alt2)∈ /u1D454/u1D45F/u1D456/u1D451}
+/u1D434,/u1D435,/u1D436,/u1D437,/u1D438←/u1D43F/u1D456/u1D45B/u1D452/u1D44E/u1D45F/u1D445/u1D452/u1D454/u1D45F/u1D452/u1D460/u1D460/u1D456/u1D45C/u1D45B(/u1D454/u1D45F/u1D456/u1D451,/u1D45D/u1D461/u1D460)
+/u1D439← max
+/u1D4651∈[/u1D459/u1D4651,/u1D462/u1D4651],/u1D466.alt1∈[/u1D459/u1D466.alt1,/u1D462/u1D466.alt1]
+/u1D4652∈[/u1D459/u1D4652,/u1D462/u1D4652],/u1D466.alt2∈[/u1D459/u1D466.alt2,/u1D462/u1D466.alt2]
+|(/u1D4651·/u1D466.alt2)+( /u1D4652·/u1D466.alt1)−( /u1D434/u1D4651+/u1D435/u1D466.alt1+/u1D436/u1D4652+/u1D437/u1D466.alt2+/u1D438)|
+/u1D459,/u1D462← min
+/u1D4651∈[/u1D459/u1D4651,/u1D462/u1D4651],/u1D466.alt1∈[/u1D459/u1D466.alt1,/u1D462/u1D466.alt1]
+/u1D4652∈[/u1D459/u1D4652,/u1D462/u1D4652],/u1D466.alt2∈[/u1D459/u1D466.alt2,/u1D462/u1D466.alt2]
+(/u1D4651·/u1D466.alt2)+( /u1D4652·/u1D466.alt1), max
+/u1D4651∈[/u1D459/u1D4651,/u1D462/u1D4651],/u1D466.alt1∈[/u1D459/u1D466.alt1,/u1D462/u1D466.alt1]
+/u1D4652∈[/u1D459/u1D4652,/u1D462/u1D4652],/u1D466.alt2∈[/u1D459/u1D466.alt2,/u1D462/u1D466.alt2]
+(/u1D4651·/u1D466.alt2)+( /u1D4652·/u1D466.alt1)
+return /u1D434ˆ/u1D4651+/u1D435ˆ/u1D466.alt1+/u1D436ˆ/u1D4652+/u1D437ˆ/u1D466.alt2+/u1D438+/u1D439/u1D716/u1D45B/u1D452/u1D464, [/u1D459,/u1D462]
+/u1D439= max
+(/u1D4651,/u1D466.alt1,/u1D4652,/u1D466.alt2)∈{/u1D459/u1D4651,/u1D462/u1D4651}×{/u1D459/u1D466.alt1,/u1D462/u1D466.alt1}×{/u1D459/u1D4652,/u1D462/u1D4652}×{/u1D459/u1D466.alt2,/u1D462/u1D466.alt2}
+|(/u1D4651·/u1D466.alt2)+( /u1D4652·/u1D466.alt1)−( /u1D434/u1D4651+/u1D435/u1D466.alt1+/u1D436/u1D4652+/u1D437/u1D466.alt2+/u1D438)|
+However, as with the chain rule, we will also solve for the lower and upper bounds, /u1D459and/u1D462,
+for(/u1D4651·/u1D466.alt2)+( /u1D4652·/u1D466.alt1) exactly. Furthermore, we can use the same proof technique to obtain these
+bounds and thus merely enumerate over the 24 corners to evaluate the expression, hence:
+/u1D459= min
+(/u1D4651,/u1D466.alt1,/u1D4652,/u1D466.alt2)∈{/u1D459/u1D4651,/u1D462/u1D4651}×{/u1D459/u1D466.alt1,/u1D462/u1D466.alt1}×{/u1D459/u1D4652,/u1D462/u1D4652}×{/u1D459/u1D466.alt2,/u1D462/u1D466.alt2}
+(/u1D4651·/u1D466.alt2)+( /u1D4652·/u1D466.alt1) (7)
+/u1D462= max
+(/u1D4651,/u1D466.alt1,/u1D4652,/u1D466.alt2)∈{/u1D459/u1D4651,/u1D462/u1D4651}×{/u1D459/u1D466.alt1,/u1D462/u1D466.alt1}×{/u1D459/u1D4652,/u1D462/u1D4652}×{/u1D459/u1D466.alt2,/u1D462/u1D466.alt2}
+(/u1D4651·/u1D466.alt2)+( /u1D4652·/u1D466.alt1) (8)
+4.3 /Q_uotient Rule Synthesized Transformer
+Synthesizing an abstract transformer for Quotient Rule is challenging due to the divisions and
+multiplications involved. In fact, many works [
+Shi et al . 2020; Stol/f_i and De Figueiredo 1997]
+decompose the abstraction of the division /u1D465//u1D466.altinto /f_irst abstracting the univariate function1//u1D466.alt,
+then abstracting the multiplication of that intermediate result with /u1D465. However, our goal is to
+avoid decomposing these expressions into basic primitives, as naively composing primitive abstract
+transformers leads to imprecision. For functions /u1D453,/u1D454: R→ R, the quotient rule is de/f_ined as:
+(/u1D453(/u1D462)
+/u1D454(/u1D462))′ = /u1D453′(/u1D462)· /u1D454(/u1D462)− /u1D453(/u1D462)· /u1D454′(/u1D462)
+/u1D454(/u1D462)2
+Forward-Mode Quotient Rule. In forward-mode AD the quotient rule is implemented as:
+/u1D467./u1D45F/u1D452/u1D44E/u1D459= /u1D465./u1D45F/u1D452/u1D44E/u1D459
+/u1D466.alt./u1D45F/u1D452/u1D44E/u1D459;
+/u1D467./u1D451/u1D462/u1D44E/u1D459= /u1D465./u1D451/u1D462/u1D44E/u1D459·/u1D466.alt./u1D45F/u1D452/u1D44E/u1D459−/u1D465./u1D45F/u1D452/u1D44E/u1D459·/u1D466.alt./u1D451/u1D462/u1D44E/u1D459
+(/u1D466.alt./u1D45F/u1D452/u1D44E/u1D459)2 ;
+where intuitively/u1D467./u1D451/u1D462/u1D44E/u1D459=(/u1D453(/u1D462)
+/u1D454(/u1D462))′,/u1D465./u1D451/u1D462/u1D44E/u1D459= /u1D453′(/u1D462), and/u1D466.alt./u1D451/u1D462/u1D44E/u1D459=/u1D454′(/u1D462).
+Proc. ACM Program. Lang., Vol. 7, No. OOPSLA2, Article 291. Publication date: October 2023.
+291:16 Jacob Laurel, Siyuan Brant Qian, Gagandeep Singh, Sasa Misailovic
+Reverse-Mode Quotient Rule. Likewise in reverse-mode AD the quotient rule is encoded as:
+/u1D467= /u1D465
+/u1D466.alt; ...
+/u1D467=...
+/u1D465+= 1
+/u1D466.alt·/u1D467;
+/u1D466.alt+=−/u1D465
+/u1D466.alt2 ·/u1D467;
+If one were to take the computational pattern of /u1D467./u1D451/u1D462/u1D44E/u1D459, but set /u1D465./u1D451/u1D462/u1D44E/u1D459= 0, the structure of
+the computation would be similar to the computation of /u1D466.alt. The abstraction for /u1D465can be handled
+separately using the chain rule abstraction /u1D447♯
+/u1D436/u1D453
+, as the chain rule abstraction for log′(/u1D466.alt)· /u1D467is /u1D467
+/u1D466.alt.
+Quotient Rule Abstraction Pattern. Based on the quotient rule implementations shown above,
+the computational pattern for which we want to synthesize an abstract transformer is:
+/u1D454(/u1D4651,/u1D466.alt1,/u1D4652,/u1D466.alt2) =(/u1D4652·/u1D466.alt1)−( /u1D4651·/u1D466.alt2)
+/u1D4652
+2
+This pattern is a desirable choice for having a single abstraction, /u1D447♯
+/u1D444because there are 3 nonlinear
+multiplications and a nonlinear division, hence the pattern would otherwise be abstracted with the
+composition/u1D447♯
+∗(/u1D447♯
+/(/u1D447♯
+−(/u1D447♯
+∗(/u1D447♯
+∗(/u1D44E)))))) . Furthermore there is a high degree of correlation between
+the numerator and denominator since they both contain /u1D4652, however, due to the imprecision most
+abstract interpreters face in the presence of multiple nonlinearities, it is hard to precisely capture
+this dependency. Further, as mentioned, the computation of /u1D466.altin the reverse mode is a special
+instance of this abstraction pattern when the second argument /u1D466.alt1 = 0.
+Abstraction. We now present the synthesis of the abstract transformer for the Quotient Rule,/u1D447♯
+/u1D444,
+which Algorithm 3 presents. As before, Pasado must solve an optimization problem to obtain sound
+bounds around the synthesized linear approximation (obtained via regression). To ensure that there
+are not additional interior critical points to consider, we require some constraints on the synthesized
+coeﬃcients /u1D434,/u1D435,/u1D436,/u1D437,/u1D438given in terms of the input bounds /u1D705/u1D465/u1D456∈{/u1D459/u1D465/u1D456,/u1D462/u1D465/u1D456},/u1D705/u1D466.alt/u1D456∈{/u1D459/u1D466.alt/u1D456,/u1D462/u1D466.alt/u1D456}. Further
+it is simple to enforce these constraints - if the synthesized coeﬃcients do not satisfy the following
+constraints, we can perturb the coeﬃcients by some small /u1D6FF, which will not aﬀect the abstraction’s
+precision, but will ensure soundness. The conditions we require are:
+/u1D705/u1D4651 ≠−/u1D437
+/u1D4342 ∧
+2
+3
+√ −/u1D705/u1D466.alt1
+/u1D434/u1D437≠−3/u1D705/u1D466.alt1
+2/u1D436∧ 1
+/u1D435≠/u1D705/u1D4652∧ /u1D434
+/u1D4352 ≠/u1D705/u1D466.alt2
+The Adjust function checks that the coeﬃcients obtained by the linear regression satisfy these
+constraints, and if not, it will add small perturbations ( /u1D6FF< 10−9) until the conditions are satis/f_ied.
+Optimization Problem. To obtain a sound enclosure around the linear approximation for the
+Quotient rule, we must solve the following nonlinear, nonconvex 4D optimization problem:
+max
+/u1D4651∈[/u1D459/u1D4651,/u1D462/u1D4651],/u1D466.alt1∈[/u1D459/u1D466.alt1,/u1D462/u1D466.alt1]
+/u1D4652∈[/u1D459/u1D4652,/u1D462/u1D4652],/u1D466.alt2∈[/u1D459/u1D466.alt2,/u1D462/u1D466.alt2]
+|(/u1D4652·/u1D466.alt1)−( /u1D4651·/u1D466.alt2)
+/u1D4652
+2
+−(/u1D434/u1D4651+/u1D435/u1D466.alt1+/u1D436/u1D4652+/u1D437/u1D466.alt2+/u1D438)| (9)
+This optimization problem is more diﬃcult than the one needed for the product rule, however,
+much of the core idea is the same and it is still tractable to solve automatically . We will still need
+to check all 24 corner points{/u1D459/u1D4651,/u1D462/u1D4651}×{ /u1D459/u1D466.alt1,/u1D462/u1D466.alt1}×{ /u1D459/u1D4652,/u1D462/u1D4652}×{ /u1D459/u1D466.alt2,/u1D462/u1D466.alt2}, however, we will also
+need to check for potential critical points where the gradient could be zero and that cannot be
+Proc. ACM Program. Lang., Vol. 7, No. OOPSLA2, Article 291. Publication date: October 2023.
+Synthesizing Precise Static Analyzers for Automatic Diﬀerentiation 291:17
+Algorithm 3 Quotient Rule Abstract Transformer/u1D447♯
+/u1D444
+Input: Abstract state/u1D44Ewhere ˆ/u1D4651 =/u1D44E[/u1D4651]. ˆ/u1D4651, ˆ/u1D466.alt1 =/u1D44E[/u1D466.alt1]. ˆ/u1D466.alt1, ˆ/u1D4652 =/u1D44E[/u1D4652]. ˆ/u1D4652, and ˆ/u1D466.alt2 =/u1D44E[/u1D466.alt2]. ˆ/u1D466.alt2
+/u1D459/u1D4651,/u1D462/u1D4651←/u1D445/u1D44E/u1D45B/u1D454/u1D452(/u1D44E[/u1D4651]) and /u1D459/u1D466.alt1,/u1D462/u1D466.alt1←/u1D445/u1D44E/u1D45B/u1D454/u1D452(/u1D44E[/u1D466.alt1])
+/u1D459/u1D4652,/u1D462/u1D4652←/u1D445/u1D44E/u1D45B/u1D454/u1D452(/u1D44E[/u1D4652]) and /u1D459/u1D466.alt2,/u1D462/u1D466.alt2←/u1D445/u1D44E/u1D45B/u1D454/u1D452(/u1D44E[/u1D466.alt2])
+/u1D454/u1D45F/u1D456/u1D451←/u1D43A/u1D45F/u1D456/u1D451/u1D446/u1D44E/u1D45A/u1D45D/u1D459/u1D452([/u1D459/u1D4651,/u1D462/u1D4651]×[ /u1D459/u1D466.alt1,/u1D462/u1D466.alt1]×[ /u1D459/u1D4652,/u1D462/u1D4652]×[ /u1D459/u1D466.alt2,/u1D462/u1D466.alt2])
+/u1D45D/u1D461/u1D460←
+{
+(/u1D4652·/u1D466.alt1)−(/u1D4651·/u1D466.alt2)
+/u1D4652
+2
+:(/u1D4651,/u1D466.alt1,/u1D4652,/u1D466.alt2)∈ /u1D454/u1D45F/u1D456/u1D451
+}
+/u1D434,/u1D435,/u1D436,/u1D437,/u1D438←/u1D43F/u1D456/u1D45B/u1D452/u1D44E/u1D45F/u1D445/u1D452/u1D454/u1D45F/u1D452/u1D460/u1D460/u1D456/u1D45C/u1D45B(/u1D454/u1D45F/u1D456/u1D451,/u1D45D/u1D461/u1D460)
+Adjust(/u1D434,/u1D435,/u1D436,/u1D437,/u1D438)
+/u1D439← max
+/u1D4651∈[/u1D459/u1D4651,/u1D462/u1D4651],/u1D466.alt1∈[/u1D459/u1D466.alt1,/u1D462/u1D466.alt1]
+/u1D4652∈[/u1D459/u1D4652,/u1D462/u1D4652],/u1D466.alt2∈[/u1D459/u1D466.alt2,/u1D462/u1D466.alt2]
+|(/u1D4652·/u1D466.alt1)−(/u1D4651·/u1D466.alt2)
+/u1D4652
+2
+−(/u1D434/u1D4651+/u1D435/u1D466.alt1+/u1D436/u1D4652+/u1D437/u1D466.alt2+/u1D438)|
+/u1D459,/u1D462← min
+/u1D4651∈[/u1D459/u1D4651,/u1D462/u1D4651],/u1D466.alt1∈[/u1D459/u1D466.alt1,/u1D462/u1D466.alt1]
+/u1D4652∈[/u1D459/u1D4652,/u1D462/u1D4652],/u1D466.alt2∈[/u1D459/u1D466.alt2,/u1D462/u1D466.alt2]
+(/u1D4652·/u1D466.alt1)−(/u1D4651·/u1D466.alt2)
+/u1D4652
+2
+, max
+/u1D4651∈[/u1D459/u1D4651,/u1D462/u1D4651],/u1D466.alt1∈[/u1D459/u1D466.alt1,/u1D462/u1D466.alt1]
+/u1D4652∈[/u1D459/u1D4652,/u1D462/u1D4652],/u1D466.alt2∈[/u1D459/u1D466.alt2,/u1D462/u1D466.alt2]
+(/u1D4652·/u1D466.alt1)−(/u1D4651·/u1D466.alt2)
+/u1D4652
+2
+return /u1D434ˆ/u1D4651+/u1D435ˆ/u1D466.alt1+/u1D436ˆ/u1D4652+/u1D437ˆ/u1D466.alt2+/u1D438+/u1D439/u1D716/u1D45B/u1D452/u1D464, [/u1D459,/u1D462]
+immediately ruled out by the Hessian test. Thankfully, solving for these critical points involves
+only univariate cubic polynomial equations, as we will be able to provably rule out any interior
+critical point where /u1D4651,/u1D466.alt1, and/u1D466.alt2 are not /f_ixed to their respective lower or upper bounds. Thus the
+only potential critical points are along the edges of the 4D hypercube where /u1D4651,/u1D466.alt1, and/u1D466.alt2 are /f_ixed.
+To /f_ind these potential critical points, we only have to solve a cubic polynomial in/u1D4652. Thus this
+set will still be /f_inite as each cubic polynomial has at most 3 real roots. We now de/f_ine this set of
+potential critical points, /u1D446as solutions to 8 possible cubic equations.
+/u1D446={(/u1D4651,/u1D466.alt1,/u1D4652,/u1D466.alt2) :/u1D4651∈{/u1D459/u1D4651,/u1D462/u1D4651},/u1D466.alt1∈{/u1D459/u1D466.alt1,/u1D462/u1D466.alt1},/u1D466.alt2∈{/u1D459/u1D466.alt2,/u1D462/u1D466.alt2},/u1D436/u1D4653
+2+/u1D466.alt1/u1D4652−2/u1D4651/u1D466.alt2 = 0,/u1D4652∈[/u1D459/u1D4652,/u1D462/u1D4652]}
+Thus we can solve the maximization problem of Eq. 9 by enumerating over the corner points
+and all points in /u1D446, reducing the problem to:
+max
+(/u1D4651,/u1D466.alt1,/u1D4652,/u1D466.alt2)∈{/u1D459/u1D4651,/u1D462/u1D4651}×{/u1D459/u1D466.alt1,/u1D462/u1D466.alt1}×{/u1D459/u1D4652,/u1D462/u1D4652}×{/u1D459/u1D466.alt2,/u1D462/u1D466.alt2}
+∪/u1D446
+|(/u1D4652·/u1D466.alt1)−( /u1D4651·/u1D466.alt2)
+/u1D4652
+2
+−(/u1D434/u1D4651+/u1D435/u1D466.alt1+/u1D436/u1D4652+/u1D437/u1D466.alt2+/u1D438)|
+This strategy of solving for roots of a cubic equation to check as possible extrema can also be
+used to solve for the optimal interval lower and upper bounds. Hence we compute the following:
+/u1D459= min
+/u1D4651∈[/u1D459/u1D4651,/u1D462/u1D4651],/u1D466.alt1∈[/u1D459/u1D466.alt1,/u1D462/u1D466.alt1]
+/u1D4652∈[/u1D459/u1D4652,/u1D462/u1D4652],/u1D466.alt2∈[/u1D459/u1D466.alt2,/u1D462/u1D466.alt2]
+(/u1D4652·/u1D466.alt1)−( /u1D4651·/u1D466.alt2)
+/u1D4652
+2
+= min
+{/u1D459/u1D4651,/u1D462/u1D4651}×{/u1D459/u1D466.alt1,/u1D462/u1D466.alt1}×{/u1D459/u1D4652,/u1D462/u1D4652}×{/u1D459/u1D466.alt2,/u1D462/u1D466.alt2}
+∪/u1D446
+(/u1D4652·/u1D466.alt1)−( /u1D4651·/u1D466.alt2)
+/u1D4652
+2
+(10)
+/u1D462= max
+/u1D4651∈[/u1D459/u1D4651,/u1D462/u1D4651],/u1D466.alt1∈[/u1D459/u1D466.alt1,/u1D462/u1D466.alt1]
+/u1D4652∈[/u1D459/u1D4652,/u1D462/u1D4652],/u1D466.alt2∈[/u1D459/u1D466.alt2,/u1D462/u1D466.alt2]
+(/u1D4652·/u1D466.alt1)−( /u1D4651·/u1D466.alt2)
+/u1D4652
+2
+= max
+{/u1D459/u1D4651,/u1D462/u1D4651}×{/u1D459/u1D466.alt1,/u1D462/u1D466.alt1}×{/u1D459/u1D4652,/u1D462/u1D4652}×{/u1D459/u1D466.alt2,/u1D462/u1D466.alt2}
+∪/u1D446
+(/u1D4652·/u1D466.alt1)−( /u1D4651·/u1D466.alt2)
+/u1D4652
+2
+(11)
+where the only diﬀerence is that the set/u1D446in Equations 10 and 11 is now given by/u1D446={(/u1D4651,/u1D466.alt1,/u1D4652,/u1D466.alt2) :
+/u1D4651∈{/u1D459/u1D4651,/u1D462/u1D4651},/u1D466.alt1∈{/u1D459/u1D466.alt1,/u1D462/u1D466.alt1},/u1D466.alt2∈{/u1D459/u1D466.alt2,/u1D462/u1D466.alt2},/u1D4652 = 2/u1D4651/u1D466.alt2
+/u1D466.alt1
+,/u1D4652∈[ /u1D459/u1D4652,/u1D462/u1D4652]} .
+Proc. ACM Program. Lang., Vol. 7, No. OOPSLA2, Article 291. Publication date: October 2023.
+291:18 Jacob Laurel, Siyuan Brant Qian, Gagandeep Singh, Sasa Misailovic
+4.4 Soundness
+In this section we prove the soundness of Pasado’s synthesized abstract transformers. At a high level,
+our proof relies on the fact that at interior critical points the Hessian will be indeterminant (ensuring
+they are saddle points). Intuitively, this insight allows for ruling out the (multi-dimensional) interior,
+and thus checking only (lower dimensional) boundaries to solve the optimization problem.
+Theorem 4.1. The Chain Rule Transformers/u1D447♯
+/u1D436/u1D453
+, synthesized by Pasado for any /u1D453: R→ R obeying
+the properties of Sec. 3.2 are sound. Equivalently for /u1D44E∈ A,{/u1D453′(/u1D465)· /u1D466.alt:(/u1D465,/u1D466.alt)∈ /u1D6FE(/u1D44E)}⊆ /u1D6FE(/u1D447♯
+/u1D436/u1D453
+(/u1D44E))
+Proof. Let/u1D453(/u1D465) : R→ R and/u1D434,/u1D435,/u1D436∈ R be the coeﬃcients inferred by the linear regression.
+To ensure soundness of/u1D447♯
+/u1D436/u1D453
+, our goal reduces to solving the following optimization problem:
+/u1D45A/u1D44E/u1D465/u1D465∈[/u1D459/u1D465,/u1D462/u1D465],/u1D466.alt∈[/u1D459/u1D466.alt,/u1D462/u1D466.alt]|/u1D453′(/u1D465)· /u1D466.alt−(/u1D434/u1D465+/u1D435/u1D466.alt+/u1D436)|
+Instead of looking for interior critical points with the /f_irst derivative test, we /f_irst examine the
+Hessian,/u1D43B, of /u1D453′(/u1D465)· /u1D466.alt−(/u1D434/u1D465+/u1D435/u1D466.alt+/u1D436) which is given as:
+/u1D43B=
+[ /u1D453′′′(/u1D465)· /u1D466.alt /u1D453′′(/u1D465)
+/u1D453′′(/u1D465) 0
+]
+The Hessian determinant is−(/u1D453′′(/u1D465)2) which is always≤ 0. For any/u1D465such that /u1D453′′(/u1D465) ≠ 0, then
+−(/u1D453′′(/u1D465)2) < 0, ruling out any interior critical point since the Hessian determinant is negative.
+Further, any/u1D465such that /u1D453′′(/u1D465) = 0 cannot be a critical point, since from the /f_irst derivative test
+/u1D453′′(/u1D465)− /u1D434= 0 is necessary for a critical point, however, if /u1D453′′(/u1D465) = 0 then/u1D453′′(/u1D465)− /u1D434=−/u1D434≠ 0,
+since we required /u1D434≠ 0. Thus the optimal value will occur along the 4 boundary lines of the
+square. The /f_irst two boundary lines (/u1D465=/u1D459/u1D465or/u1D465=/u1D462/u1D465) are simple, since the optimal value of a
+linear function will occur at the end points, thus it suﬃces to check the 4 corners {/u1D459/u1D465,/u1D462/u1D465}×{ /u1D459/u1D466.alt,/u1D462/u1D466.alt}.
+For the boundary lines where we /f_ix/u1D466.alt= /u1D459/u1D466.altor/u1D466.alt= /u1D462/u1D466.alt, we now only have to solve univariate
+optimization problems. Applying the /f_irst derivative test to/u1D453′(/u1D465)/u1D459/u1D466.altand/u1D453′(/u1D465)/u1D462/u1D466.altwe must solve for
+all/u1D465∗∈[ /u1D459/u1D465,/u1D462/u1D465] such that /u1D453′′(/u1D465∗)/u1D459/u1D466.alt−/u1D434= 0 as well as all/u1D465∗∗∈[ /u1D459/u1D465,/u1D462/u1D465] such that /u1D453′′(/u1D465∗∗)/u1D462/u1D466.alt−/u1D434= 0.
+However, these equations can be solved as we already required that one has a veri/f_ied root solver
+for /u1D453′′. Hence we just check (/u1D465∗,/u1D459/u1D466.alt) and(/u1D465∗∗,/u1D462/u1D466.alt) for all /u1D465∗,/u1D465∗∗∈[ /u1D459/u1D465,/u1D462/u1D465] returned by the root
+solver. Furthermore, the Hessian determinant of−(/u1D453′(/u1D465)· /u1D466.alt−(/u1D434/u1D465+/u1D435/u1D466.alt+/u1D436)) will be identical, and
+any critical point of /u1D453′(/u1D465)· /u1D466.alt−(/u1D434/u1D465+/u1D435/u1D466.alt+/u1D436) will be a critical point of−(/u1D453′(/u1D465)· /u1D466.alt−(/u1D434/u1D465+/u1D435/u1D466.alt+/u1D436)) ,
+hence we need not worry about the absolute value in the maximization problem. The full details
+can be found in the appendix [ Laurel et al. 2023a ].
+□
+Theorem 4.2. The Product Rule Transformer,/u1D447♯
+/u1D443, synthesized by Pasado is sound. Equivalently for
+/u1D44E∈ A,{/u1D4651·/u1D466.alt2+/u1D4652·/u1D466.alt1 :(/u1D4651,/u1D466.alt1,/u1D4652,/u1D466.alt2)∈ /u1D6FE(/u1D44E)}⊆ /u1D6FE(/u1D447♯
+/u1D443(/u1D44E))
+Proof. (sketch) The Hessian for(/u1D4651·/u1D466.alt2)+( /u1D4652·/u1D466.alt1)−( /u1D434/u1D4651+/u1D435/u1D466.alt1+/u1D436/u1D4652+/u1D437/u1D466.alt2+/u1D438) at any point is
+the matrix
+
+
+
+
+
+
+
+
+0 0 0 1
+0 0 1 0
+0 1 0 0
+1 0 0 0
+
+
+
+
+
+
+
+
+which has both positive and negative eigenvalues, meaning the Hessian
+is everywhere indeterminant. Hence any potential critical point is necessarily a saddle point, thus
+the extrema must occur along the boundaries. We repeat this procedure for each of the (4
+3
+)
+3D
+boundary optimization problems where in each case 1 of the 4 dimensions is /f_ixed to a lower or
+Proc. ACM Program. Lang., Vol. 7, No. OOPSLA2, Article 291. Publication date: October 2023.
+Synthesizing Precise Static Analyzers for Automatic Diﬀerentiation 291:19
+upper boundary. The (unique) 3D sub-problem Hessians are
+
+
+
+
+
+
+0 0 0
+0 0 1
+0 1 0
+
+
+
+
+
+
+,
+
+
+
+
+
+
+0 0 1
+0 0 0
+1 0 0
+
+
+
+
+
+
+, and
+
+
+
+
+
+
+0 1 0
+1 0 0
+0 0 0
+
+
+
+
+
+
+all of which have both positive and negative eigenvalues meaning any interior point along the 3D
+boundary of the 4D cube is necessarily a saddle point. Repeating this same procedure for the 2D
+subproblems we again /f_ind that all 2D Hessians are either indeterminant which implies any interior
+critical point is a saddle (thus the extrema occurs on the corners) or the 2D subproblem is such that
+the function is linear in which case the extrema will also occur only on the corners. Furthermore, by
+lemma
+A.1 these same properties hold for−((/u1D4651·/u1D466.alt2)+( /u1D4652·/u1D466.alt1)−( /u1D434/u1D4651+/u1D435/u1D466.alt1+/u1D436/u1D4652+/u1D437/u1D466.alt2+/u1D438)) thus
+handling the absolute value in the maximization problem. The full proof is found in the appendix.
+□
+Theorem 4.3. The Quotient Rule Transformer,/u1D447♯
+/u1D444synthesized by Pasado is sound. Equivalently for
+/u1D44E∈ A,{/u1D4652·/u1D466.alt1−/u1D4651·/u1D466.alt2
+/u1D4652
+2
+:(/u1D4651,/u1D466.alt1,/u1D4652,/u1D466.alt2)∈ /u1D6FE(/u1D44E)}⊆ /u1D6FE(/u1D447♯
+/u1D444(/u1D44E))
+Proof. (sketch) The 4D Hessian is
+
+
+
+
+
+
+
+
+
+
+0 0 2/u1D451
+/u1D4653
+2
+−1
+/u1D4652
+2
+0 0 −1
+/u1D4652
+2
+0
+2/u1D466.alt2
+/u1D4503
+−1
+/u1D4652
+2
+6(/u1D466.alt1/u1D4652−/u1D4651/u1D466.alt2)
+/u1D4654
+2
+− 4/u1D466.alt1
+/u1D4653
+2
+2/u1D4651
+/u1D4653
+2
+−1
+/u1D4652
+2
+0 2/u1D4651
+/u1D4653
+2
+0
+
+
+
+
+
+
+
+
+
+
+and its determinant is
+1
+/u1D4658
+2
+, meaning that the the Hessian has no zero eigenvalues since /u1D4652 ≠ 0. Furthermore, by Sylvester’s
+criteria the Hessian is neither positive de/f_inite nor negative de/f_inite, hence it is indeterminant
+which implies any interior critical point is necessarily a saddle point, thus the extrema will occur
+along a boundary of the 4D cube. The cases for optimizing along these 3D boundaries, and their
+respective 2D boundaries, and their respective 1D boundaries are all shown in the Appendix. □
+Given the similarity in all three proofs, the same ideas could theoretically be used to support other
+nonlinear expressions, provided their respective Hessians also rule out interior critical points.
+4.5 Precision
+Having now de/f_ined how to solve the optimization problems needed for Pasado’s abstract trans-
+formers and their soundness, we can now state the following theorem about their precision:
+Theorem 4.4. The lower and upper interval bounds computed by Pasado’s synthesized abstract
+transformers in Equations 4, 5, 7, 8, 10, and 11 are optimal for the interval domain.
+Proof. (sketch) Since Pasado solves these optimization problems exactly, instead of upper
+bounding the maximum or lower bounding the minimum, the bounds cannot be any tighter. □
+Hence for these AD patterns, a standard interval arithmetic where one composes abstractions
+of each primitive function or operation (/u1D447♯
+/u1D453,/u1D447♯
+/u1D45C/u1D45D) can never be more precise than Pasado. Further,
+because Pasado uses the standard abstract transformers in the real (primal) part of the program,
+those bounds are at least as precise as standard interval arithmetic, thus Pasado’s derivative bounds
+are never less precise than abstractly interpreting AD with the interval domain.
+4.6 Generality
+While we focus on the zonotope and interval abstract domains, Pasado is applicable to other abstract
+domains that can represent linear relationships symbolically. We now state how to use Pasado to
+obtain sound transformers for quadratic and polynomial zonotopes and the DeepPoly domains.
+Proc. ACM Program. Lang., Vol. 7, No. OOPSLA2, Article 291. Publication date: October 2023.
+291:20 Jacob Laurel, Siyuan Brant Qian, Gagandeep Singh, Sasa Misailovic
+Theorem 4.5. The abstract transformers synthesized by Pasado are also sound transformers for
+quadratic and polynomial zonotopes and for the DeepPoly domain.
+Proof. As we only synthesize linear transformations of the input aﬃne forms, if these aﬃne
+forms were replaced with quadratic or polynomial forms, a linear transformation of them would
+still be a valid quadratic or polynomial term expressible in those domains. For adapting the chain
+rule to the DeepPoly domain we set the lower linear bound to be /u1D44E≥ =/u1D434/u1D4651+/u1D435/u1D466.alt1+(/u1D436−/u1D437) and the
+upper linear bound to be /u1D44E≤ =/u1D434/u1D4651+/u1D435/u1D466.alt1+(/u1D436+/u1D437) instead of returning an aﬃne form and still use
+/u1D459,/u1D462for the interval bounds. Likewise for adapting the product and quotient rule transformers to the
+DeepPoly domain we set the lower linear bound as /u1D44E≥ =/u1D434/u1D4651+/u1D435/u1D466.alt1+/u1D436/u1D4652+/u1D437/u1D466.alt2+(/u1D438−/u1D439) and the
+upper linear bound as/u1D44E≤ =/u1D434/u1D4651+/u1D435/u1D466.alt1+/u1D436/u1D4652+/u1D437/u1D466.alt2+(/u1D438+/u1D439) and use/u1D459,/u1D462for the interval bounds. □
+Thus, Pasado’s combined support for multiple AD computational patterns, function primitives, and
+abstract domains, provides the necessary generality for synthesizing static analyzers for AD.
+5 CASE STUDIES
+We now present multiple Case Studies demonstrating the bene/f_its of synthesizing precise abstract
+transformers tailored to the structure of both forward-mode AD (Sections 5.2 and 5.4) and reverse-
+mode AD (Sections 5.3 and 5.5).
+5.1 Methodology
+We describe our experimental setup. We ran the experiments in Sections 5.2 and 5.3 on a 10-core
+Apple M1 Pro SoC with 16 GB of uni/f_ied memory. We ran the experiments in Sections5.4 and 5.5
+on a 32-core AMD Ryzen Threadripper PRO 3975WX CPU and an NVIDIA RTX A5000 GPU with
+512 GB RAM. In all experiments, as baselines, we use AD with the interval domain [ Laurel et al.
+2022a] and AD with the zonotope domain [ Laurel et al. 2022b], which collectively comprise the
+state of the art for abstracting AD.
+Implementation. We implement Pasado in Python, using a combination of the affapy li-
+brary [Helaire et al 2021 ], the micrograd library [Karpathy et al. 2020 ] and PyTorch [Paszke et al .
+2019]. Pasado’s implementation assumes ideal real arithmetic and is thus not /f_loating-point sound
+(though /f_loating-point sound versions of the operations exist [Miné 2004]). While the part of the
+implementation using affapy supports all cases, the part written in PyTorch leverages the speci/f_ic
+structure of DNNs and is thus only applicable to DNN benchmarks. For the experiments in Sections
+5.2, 5.3, and 5.5 we implemented the baselines ourselves, as there was no existing code-base to use,
+however for Section 5.4 we used the implementation of [ Laurel et al. 2022b ] directly.
+5.2 Robust Sensitivity Analysis of Ordinary Diﬀerential Equations
+This /f_irst case study involves performing provable sensitivity analysis on the solutions of ODEs.
+As mentioned in the example section, to perform sensitivity analysis on the numerical solution
+of any ODE, one must automatically diﬀerentiate through the ODE solver. For these experiments
+we instantiate our technique with forward-mode AD. In our experiments we use a 4th-order
+Runge-Kutta numerical solver which is more complicated than the Euler method, but a more
+commonly used and accurate solver in practice. Hence for this evaluation ODESolve does not use
+Euler integration (unlike the example in Section 2). We now examine the following ODEs:
+Chemistry ODE. This ODE is taken from Kitchin [2018]; Saltelli et al . [2005] and models the
+concentration of chemical species /u1D436/u1D434as a function of time /u1D461. The ODE is parameterized by rate
+constants/u1D4581 and/u1D458−1.
+/u1D451/u1D436/u1D434
+/u1D451/u1D461=−/u1D4581·/u1D436/u1D434+/u1D458−1·(/u1D4360−/u1D436/u1D434) (12)
+Proc. ACM Program. Lang., Vol. 7, No. OOPSLA2, Article 291. Publication date: October 2023.
+Synthesizing Precise Static Analyzers for Automatic Diﬀerentiation 291:21
+10−1
+Pasado Interval Width
+10−1
+100
+101
+Baseline Interval Width
+(a)
+1004× 10−1 6× 10−1
+Pasado Interval Width
+100
+101
+Interval
+Zonotope
+(b)
+Fig. 5. Sca/t_ter plots in logarithmic scales comparing the interval widths of the bounds on the derivatives of
+(a) ODESolve/u1D441/u1D441with respect to/u1D4581 and (b) ODESolve/u1D453with respect to/u1D4470.
+1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16−0.25
+−0.20
+−0.15
+−0.10
+−0.05
+0.00
+Zonotope
+Pasado
+Scalar
+1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16
+−0.1
+0.0
+0.1
+0.2
+0.3
+Time Step
+Sensitivity
+Fig. 6. Bounds on the sensitivities of ODESolve/u1D441/u1D441with respect to /u1D4581 (le/f_t) and /u1D458−1 (right). Each region
+between line segments of the same color represents the interval bound computed by that respective method’s
+abstract AD. The dots represent the sensitivities evaluated at points sampled from the input intervals.
+However, instead of numerically solving the ODE given in Eq. 12, we train a neural network,
+/u1D441/u1D441, to learn the dynamics such that /u1D441/u1D441(/u1D4581,/u1D458−1,/u1D4360,/u1D436/u1D434)≈− /u1D4581·/u1D436/u1D434+/u1D458−1·(/u1D4360−/u1D436/u1D434), hence we
+will actually numerically solve the following Neural ODE:
+/u1D451/u1D436/u1D434
+/u1D451/u1D461=/u1D441/u1D441(/u1D4581,/u1D458−1,/u1D4360,/u1D436/u1D434) (13)
+The neural ODE approximation produces nearly identical results, hence it serves as a useful
+surrogate model and also as a representative workload for ODEs where the underlying dynamics are
+some learned model. In
+Kitchin [2018]; Saltelli et al. [2005], the authors perform sensitivity analysis
+on this chemistry model using AD. However, those works computed sensitivities at scalar points
+only, hence we are the /f_irst to abstractly compute this derivative-based sensitivity analysis forsets of
+points. A key reason for performing the sensitivity analysis is to understand how sensitive the /f_inal
+concentration is to the rate constant parameters /u1D4581 and/u1D458−1. For this evaluation, we parameterize
+the ODE solver by the neural network dynamics function /u1D441/u1D441, thus ODESolve/u1D441/u1D441denotes a 4/u1D461/uni210E
+order Runge-Kutta solver for Eq. 13. Thus we abstractly interpret AD to compute precise bounds on
+both /u1D715
+/u1D715/u1D4581
+ODESolve/u1D441/u1D441(/u1D4581,/u1D458−1,/u1D4610,/u1D4360,/u1D436/u1D4340,/uni210E,/u1D45B) and /u1D715
+/u1D715/u1D458−1
+ODESolve/u1D441/u1D441(/u1D4581,/u1D458−1,/u1D4610,/u1D4360,/u1D436/u1D434,/uni210E,/u1D45B), where
+/uni210Eis the step size and /u1D45Bis the number of time steps.
+In Fig. 5a, we plot the point(/u1D462/u1D45C/u1D462/u1D45F/u1D460−/u1D459/u1D45C/u1D462/u1D45F/u1D460,/u1D462/u1D45C/u1D461/uni210E/u1D452/u1D45F−/u1D459/u1D45C/u1D461/uni210E/u1D452/u1D45F), where the bounds /u1D459/u1D45C/u1D462/u1D45F/u1D460and/u1D462/u1D45C/u1D462/u1D45F/u1D460are
+with respect to /u1D4581 and obtained from Pasado and /u1D459/u1D45C/u1D461/uni210E/u1D452/u1D45Fand/u1D462/u1D45C/u1D461/uni210E/u1D452/u1D45Fare the respective lower and
+upper bounds computed by the other method (regular intervals, regular zonotopes), for each input
+con/f_iguration and for each method. The red line denotes the identity function/u1D466.alt=/u1D465, hence any
+plotted point that lies above the red line signi/f_ies that Pasado’s bounds were tighter, as a point
+Proc. ACM Program. Lang., Vol. 7, No. OOPSLA2, Article 291. Publication date: October 2023.
+291:22 Jacob Laurel, Siyuan Brant Qian, Gagandeep Singh, Sasa Misailovic
+will lie above the line if and only if /u1D462/u1D45C/u1D461/uni210E/u1D452/u1D45F−/u1D459/u1D45C/u1D461/uni210E/u1D452/u1D45F
+/u1D462/u1D45C/u1D462/u1D45F/u1D460−/u1D459/u1D45C/u1D462/u1D45F/u1D460
+> 1. Furthermore, both the /u1D465- and /u1D466.alt-axes use
+logarithmic scales, hence even if points visually appear close together, the diﬀerence in precision
+may be substantial. The input ranges we use to generate this plot are all the 512 combinations of
+/u1D4581 = 3±/u1D6FF/u1D4581,/u1D458−1 = 3±/u1D6FF/u1D458−1,/u1D4360 = 1±/u1D6FF/u1D4360,/u1D436/u1D434= 1±/u1D6FF/u1D436/u1D434,/u1D4610 = 0,/u1D45B={8, 10, 12, 16} and/uni210E∈{ 0. 025, 0. 1},
+where/u1D6FF/u1D4581∈{ 0. 05, 0. 1, 0. 15, 0. 2},/u1D6FF/u1D458−1∈{ 0. 1, 0. 2, 0. 25, 0. 3},/u1D6FF/u1D4360∈{ 0. 1, 0. 2},/u1D6FF/u1D436/u1D434∈{ 0. 1, 0. 2}, which
+are based on the ranges considered in Saltelli et al. [2005].
+Fig. 5a shows that in all input con/f_igurations, all the points for the baseline approaches lie above
+the red line, meaning that Pasado produces the most precise results. In all 512 cases the derivative
+bound computed with Pasado is strictly contained inside the bound computed via interval AD,
+and likewise in 497/512 cases the bound computed via Pasado is contained strictly inside the
+bound computed via zonotope AD (the bounds are incomparable in 15/512 cases). Only 20
+/512
+green points are shown since in the other cases, the interval analysis generates results that are
+too over-approximate (
+> 1020) to be meaningful. The geometric mean of precision improvement
+over all green points (comparing Pasado to interval AD) is 60. 89 times, and the geometric mean of
+precision improvement over all orange points (comparing Pasado to zonotope AD) is 1. 65 times.
+We next focus on a speci/f_ic input con/f_iguration for /f_iner granularity. For our speci/f_ic con/f_ig-
+uration we use the following ranges to perform the sensitivity analysis of the Chemical ODE:
+/u1D4581∈[ 2. 95, 3. 05],/u1D458−1∈[ 2. 8, 3. 2],/u1D4610 = 0,/u1D4360∈[ 0. 9, 1. 1],/u1D436/u1D434∈[ 0. 8, 1. 2],/uni210E= 0. 025, and/u1D45B= 16, again
+based on the ranges considered in Saltelli et al . [2005]. Fig. 6 illustrates the bounds on these sensi-
+tivities for the numerical solution of Eq. 12 with respect to/u1D4581 and/u1D458−1, with the/u1D465-axis representing
+the time steps and the /u1D466.alt-axis representing the sensitivities. For each color, the upper and lower
+line segments represent the upper and lower bounds obtained by that method, respectively. We
+can see from both /f_igures that Pasado always produce narrower bounds compared to the standard
+zonotope analysis. Additionally, within all the 16 time steps, as is shown in the left sub/f_igure
+of Fig. 6, Pasado can formally prove the monotonicity of ODESolve/u1D441/u1D441with respect to /u1D4581 in this
+con/f_iguration (monotonically decreasing since the sensitivity is strictly less than 0), while the
+zonotope analysis cannot prove the monotonicity after the 12th step.
+We measure the performance of the three methods by calculating the average runtimes for
+one speci/f_ic input con/f_iguration over16 time steps, since varying input bounds has negligible
+eﬀects on runtimes. The average runtimes for the interval AD and zonotope AD are 0. 12 and 81
+seconds, respectively. Pasado takes 47 seconds on average, which is faster than zonotope AD - this
+improvement directly results from Pasado storing fewer noise symbols, which we found to be the
+biggest computational bottleneck of the affapy library.
+Climate ODE. The Climate ODE is the same as in the example section and is taken from Kaper
+and Engler [2013] and models the global mean temperature through an energy balance model.
+In Fig. 5b, we plot the points representing (/u1D462/u1D45C/u1D462/u1D45F/u1D460−/u1D459/u1D45C/u1D462/u1D45F/u1D460,/u1D462/u1D45C/u1D461/uni210E/u1D452/u1D45F−/u1D459/u1D45C/u1D461/uni210E/u1D452/u1D45F) for the derivative of the
+numerical solution of Eq. 1 with respect to the initial condition /u1D4470 following the same format as
+Fig. 5a. The diﬀerent input con/f_igurations we use to generate this plot are all the 32 combinations
+of/u1D4470∈{ 337. 5± 37. 5, 337. 5± 62. 5},/u1D445=[2. 65, 2. 95],/u1D444∈{ 342, 360± 90},/u1D6FC∈{ 0. 35, 0. 325± 0. 025},
+/u1D452=[3. 402224652× 10−8, 5. 103336978× 10−8],/u1D45B∈{ 8, 12} and/uni210E∈{ 0. 025, 0. 05}, which are based on
+realistic ranges discussed in Walsh [2015].
+All of the points for the baseline approaches in Fig. 5b lie above the red line (Pasado), indicating
+that Pasado yields more accurate results in all cases, and additionally for all 32 of the con/f_igurations,
+the derivative bounds computed by Pasado are strictly contained within the bounds computed
+via interval AD and zonotope AD. The geometric mean of the precision improvement over all
+green points (comparing Pasado to interval AD) is approximately 2. 85 times, and the geometric
+mean of the precision improvement over all orange points (comparing Pasado to zonotope AD) is
+Proc. ACM Program. Lang., Vol. 7, No. OOPSLA2, Article 291. Publication date: October 2023.
+Synthesizing Precise Static Analyzers for Automatic Diﬀerentiation 291:23
+10−1 100
+10−1
+100
+101
+102 Interval
+Zonotope
+10−1 100
+10−1
+100
+101
+102
+101 102
+101
+102
+103
+104
+102 103
+102
+103
+104
+105
+100 101
+100
+101
+102
+Pasado Interval Width
+Baseline Interval Width
+Fig. 7. Sca/t_ter plots in logarithmic scales comparing the interval widths of the output bounds on the reverse-
+mode derivatives of the Black-Scholes solution with respect to /u1D43E,/u1D446,/u1D70E,/u1D70F, and/u1D45F, from le/f_t to right, respectively.
+approximately 1. 31 times. Additionally, we observe that the bene/f_it gained from Pasado becomes
+more pronounced for larger input intervals, as demonstrated by the greater vertical distance
+between the data points and the red line as we move further right along the /u1D465-axis.
+Fig. 3 in Section 2 represents a plot of a speci/f_ic input con/f_iguration and shows the bounds on the
+sensitivities of numerical solution of Eq. 1 with respect to the initial condition input /u1D4470, formatted
+identically to each sub/f_igure of Fig.6. The speci/f_ic input con/f_iguration used for the plot in Fig.3 is
+/u1D4470∈[ 275, 400],/u1D445∈[ 2. 65, 2. 95],/u1D444= 342,/u1D6FC= 0. 3,/u1D452∈[ 3. 402224652× 10−8, 5. 103336978× 10−8],
+/uni210E= 0. 025, and/u1D45B= 12. Again, Pasado produces the most precise bounds among the three methods.
+Within all the 12 iterations, Pasado can show the monotonicity of the numerical solution with
+respect to the initial condition /u1D4470.
+We measure the performance of the three methods by calculating the average runtimes for one
+speci/f_ic input con/f_iguration over12 time steps, since varying input bounds has negligible eﬀects
+on runtimes. The average runtimes for the interval AD, zonotope AD, and Pasado are 0. 0044, 0. 068,
+and 0. 25 seconds, respectively.
+5.3 Black Scholes
+In the next case study, we use our synthesized AD abstractions to compute bounds on the derivatives
+of the Black-Scholes solution with respect to the diﬀerent parameters. The Black-Scholes model is a
+solution to a Partial Diﬀerential Equation (PDE) modeling /f_inancial option values. The parameters
+of the Black-Scholes model are volatility/u1D70E, time/u1D70F, strike price/u1D43E, spot price/u1D446and interest rate/u1D45F. The
+derivatives of the Black-Scholes solution with respect to these parameters are commonly known
+as the "greeks, " and while prior work has computed bounds on the greeks [ Vassiliadis et al. 2016],
+only the interval domain was used, hence this experiment demonstrates the precision improvement
+obtained from using Pasado’s synthesized abstract transformers. Since there are multiple inputs
+but only a single output, we elect for (abstract) reverse-mode AD.
+For this experiment we compare our approach against both interval and zonotope abstract AD.
+We perform the evaluation for diﬀerent ranges of the parameter values to study how varying the
+size of the input intervals aﬀects the precision. The input ranges we use are all the 54 combinations
+of/u1D43E= 100±/u1D6FF/u1D43E,/u1D446= 105±/u1D6FF/u1D446,/u1D70E= 5±/u1D6FF/u1D70E,/u1D70F= 0. 08219±/u1D6FF/u1D70F,/u1D45F= 0. 0125±/u1D6FF/u1D45F, where/u1D6FF/u1D43E∈{ 1, 5, 10},
+/u1D6FF/u1D70F∈{ 1, 5, 10},/u1D6FF/u1D70E∈{ 0. 5, 1, 2},/u1D6FF/u1D70F∈{ 0. 001, 0. 01},/u1D6FF/u1D45F= 0. 001. Furthermore, there are 5 greeks and
+54 diﬀerent con/f_igurations, hence there are 270 total derivative bounds computed.
+We plot the points (/u1D462/u1D45C/u1D462/u1D45F/u1D460−/u1D459/u1D45C/u1D462/u1D45F/u1D460,/u1D462/u1D45C/u1D461/uni210E/u1D452/u1D45F−/u1D459/u1D45C/u1D461/uni210E/u1D452/u1D45F) in Fig. 7 for all the derivatives of the Black-
+Scholes solution with respect to the /f_ive "greeks, " with the same layout as Fig.5a. As can be seen, in
+all cases all points lie above the red line, hence demonstrating that Pasado produces the most precise
+results. The bounds computed with Pasado are strictly contained inside the bounds computed
+with zonotope AD in 263/270 cases (rest are incomparable). The geometric mean of the precision
+improvement over all green points (comparing Pasado to interval AD) is approximately 4. 03 times,
+and the geometric mean of the precision improvement over all orange points (comparing Pasado to
+Proc. ACM Program. Lang., Vol. 7, No. OOPSLA2, Article 291. Publication date: October 2023.
+291:24 Jacob Laurel, Siyuan Brant Qian, Gagandeep Singh, Sasa Misailovic
+10−3 10−1
+/u1D6FC/u1D45A/u1D44E/u1D465
+102
+103
+104
+Lipschitz Constant
+3-Layer FFNN
+Zonotope
+Interval
+Pasado
+10−3 10−1
+/u1D6FC/u1D45A/u1D44E/u1D465
+103
+104
+105
+4-Layer FFNN
+10−3 10−1
+/u1D6FC/u1D45A/u1D44E/u1D465
+103
+105
+5-Layer FFNN
+10−3 10−1
+/u1D6FC/u1D45A/u1D44E/u1D465
+103
+105
+107
+FFNNBig
+(a) Average upper bounds on the local Lipschitz constants for the interval AD, zonotope AD, and Pasado.
+10−3 10−1
+/u1D6FC/u1D45A/u1D44E/u1D465
+2. 5
+5. 0
+7. 5
+10. 0
+Lipschitz Constant Ratio
+3-Layer FFNN
+10−3 10−1
+/u1D6FC/u1D45A/u1D44E/u1D465
+0
+10
+20
+30
+4-Layer FFNN
+10−3 10−1
+/u1D6FC/u1D45A/u1D44E/u1D465
+0
+50
+100
+5-Layer FFNN
+10−3 10−1
+/u1D6FC/u1D45A/u1D44E/u1D465
+0
+50
+100
+150
+FFNNBig
+(b) Increase in precisions of Pasado over zonotope AD.
+Fig. 8. Lipschitz robustness of FFNNs with 3 (far le/f_t), 4 (le/f_t-center), or 5 (right-center) aﬀine layers and
+FFNNBig (far right) against the haze perturbation on 1000 correctly classified test images. The top row (Fig. 8a)
+shows the average upper bounds on the local Lipschitz constant with respect to diﬀerent /u1D6FC/u1D45A/u1D44E/u1D465for the interval
+AD, zonotope AD, and Pasado. The bo/t_tom row (Fig. 8b) shows the increase in precision of Pasado, computed
+as the ratio of the zonotope-bounded Lipschitz constant over the Pasado-bounded Lipschitz constant.
+zonotope AD) is approximately 2. 81 times. Furthermore, for larger input intervals (further right
+along the x-axis) the improvement obtained from Pasado becomes more substantial, as evidenced
+by the higher vertical distance of the points above the line.
+We measure the runtime performance of each method by calculating the average runtimes across
+all input con/f_igurations. The average runtimes (per con/f_iguration) for the interval AD, zonotope
+AD, and Pasado are 0. 0015, 0. 01, and 0. 05 seconds, respectively.
+5.4 Lipschitz Robustness of Neural Networks
+In this case study, we consider the task of computing the local Lipschitz constant of a neural
+network’s output with respect to an adversarial perturbation parameter as in [ Laurel et al. 2022a,b].
+We study DNNs trained on the MNIST dataset and consider the Haze perturbation given as
+/u1D45D/u1D6FC(/u1D465/u1D456;/u1D6FC) = (1−/u1D6FC)/u1D465/u1D456+/u1D6FC, where /u1D6FCrepresents the amount of haze eﬀects and /u1D465/u1D456corresponds
+to the/u1D456/u1D461/uni210Einput pixel. For the sake of direct comparison, we evaluate on the same range of values
+for the perturbation parameter /u1D6FCas in Laurel et al. [2022b].
+Fig. 8 shows the results of Lipschitz certi/f_ication for feed-forward neural networks (FFNNs) with
+3, 4, and 5 aﬃne layers. The test accuracies for these three FFNNs are 92. 7%, 89. 2%, and 86. 7%,
+respectively. Fig. 8a illustrates the bounds on the Lipschitz constants, where the /u1D465-axis represents
+the values of /u1D6FC/u1D45A/u1D44E/u1D465and the /u1D466.alt-axis represents the average upper bounds on the corresponding
+Lipschitz constants (smaller being preferable) for interval AD, zonotope AD, and Pasado. Fig. 8b
+exhibits the increase in precision of Pasado over zonotope AD, with the /u1D465-axis showing the values
+of/u1D6FC/u1D45A/u1D44E/u1D465and the/u1D466.alt-axis showing the ratio of the zonotope-bounded Lipschitz constants over the
+Pasado-bounded Lipschitz constants (larger being preferable). Given that the results produced
+by zonotope AD and Pasado are orders of magnitude smaller than those from interval AD for
+/u1D6FC/u1D45A/u1D44E/u1D465> 10−2, we employ logarithmic scales for both the /u1D465- and the/u1D466.alt-axes to enable a more visually
+clear separation between the curves representing zonotope AD and Pasado.
+Proc. ACM Program. Lang., Vol. 7, No. OOPSLA2, Article 291. Publication date: October 2023.
+Synthesizing Precise Static Analyzers for Automatic Diﬀerentiation 291:25
+As shown in Fig. 8, there is a signi/f_icant improvement in precision when using Pasado in
+comparison to using the interval AD or zonotope AD. In particular, for suﬃciently large values of
+/u1D6FC/u1D45A/u1D44E/u1D465, speci/f_ically where/u1D6FC/u1D45A/u1D44E/u1D465> 10−2, the bounds on the Lipschitz constants for 5-layer network
+that we compute are between 4− 100× smaller than the bounds computed by the zonotope AD.
+In contrast, for smaller values of /u1D6FC/u1D45A/u1D44E/u1D465, particularly when/u1D6FC/u1D45A/u1D44E/u1D465< 10−3, Pasado and zonotope AD
+produce Lipschitz constants of nearly identical magnitudes.
+We measure the performance of the three methods by calculating the average runtime across all
+input con/f_igurations used to generate the plots. For the 3-layer network, the average runtimes for
+the interval AD, zonotope AD, and Pasado are 0. 00338, 0. 00210, and 0. 0636 seconds, respectively.
+For the 4-layer network, the average runtimes are 0. 00383, 0. 00352, and 0. 0969 seconds, respectively.
+For the 5-layer network, the average runtimes are 0. 00469, 0. 00533, and 0. 135 seconds, respectively.
+The far right sub/f_igure in Fig.8 shows that Pasado is scalable to a larger FFNN, speci/f_ically the
+FFNNBig architecture from Singh et al . [2019b]. The test accuracy for our FFNNBig instance is
+95. 8%. As in previous plots, both the /u1D465- and the /u1D466.alt-axes use logarithmic scales. Compared to the
+zonotope analysis, Pasado can be up to 182× more precise and the local Lipschitz constants can be
+up to 2. 01× 106 smaller. The average runtimes for interval AD, Zonotope AD and Pasado on the
+FFNNBig network are 0. 0542, 0. 361, and 1. 49 seconds, respectively.
+To further illustrate the scalability and versatility of Pasado, we also evaluate it on three convolu-
+tional neural networks (CNNs), namely ConvSmall, ConvMed, and ConvBig, as de/f_ined inSingh
+et al. [2018], which are state-of-the-art CNN benchmarks for veri/f_ication. When the convolutional
+layers of these networks are unrolled into an equivalent aﬃne layer, the corresponding number of
+intermediate neurons is more than 25, 000, which means Pasado’s chain rule abstract transformer
+will be called that number of times, hence these benchmarks highlight Pasado’s scalability.
+Fig. 9 presents the results of Lipschitz robustness analysis for ConvSmall, ConvMed, and
+ConvBig. The test accuracies for these three CNNs are 98. 5%, 99. 2%, and 98. 9%, respectively. As
+in previous plots, we use logarithmic scales for clarity. Across all three CNNs, Pasado generates
+much more precise bounds. Notably, in the ConvBig network, Pasado can oﬀer up to 2750× greater
+precision, and the local Lipschitz constants can be up to 1. 99× 1011 smaller. For ConvSmall,
+the average runtimes for the interval analysis, zonotope analysis, and Pasado are 3. 38, 3. 64, and
+4. 70 seconds, respectively. For ConvMed, the average runtimes are 5. 11, 5. 70, and 7. 27 seconds,
+respectively. For ConvBig, the average runtimes are 115, 212, and 191 seconds, respectively.
+In summary, we observe that as the network architectures become larger, the precision improve-
+ments oﬀered by Pasado become more pronounced. Furthermore, in the largest convolutional
+benchmark, ConvBig, the runtime of Pasado was actually faster than the standard zonotope AD
+analysis baseline. This behavior is the consequence of Pasado generating fewer noise symbols
+compared to standard zonotope transformers, similar to the observation in the ODE benchmarks
+of Section 5.2. Hence, for suﬃciently large benchmarks (like CNNs), the computational savings
+obtained by propagating fewer noise symbols (as Pasado does) outweigh the costs (e.g. due to the
+linear regression) associated with Pasado’s more precise abstract transformers.
+5.5 Monotonicity Analysis of an Adult Income Network
+In this case study, we conduct a monotonicity analysis on a multilayer perceptron (MLP) trained
+on the Adult dataset [ Becker and Kohavi 1996 ]. Monotonocity has been shown to be highly
+desirable in order to ensure fairness [ Shi et al . 2022; Sivaraman et al . 2020]. Our MLP takes
+87 input features (where 81 of the 87 features result from one-hot encodings of the original
+dataset’s categorical variables), passes these features through two hidden layers (each containing 10
+neurons and applying tanh activation), and outputs a single binary classi/f_ication score predicting
+the income level. Our goal is to verify the monotonicity (both increasing and decreasing) of
+Proc. ACM Program. Lang., Vol. 7, No. OOPSLA2, Article 291. Publication date: October 2023.
+291:26 Jacob Laurel, Siyuan Brant Qian, Gagandeep Singh, Sasa Misailovic
+0. 63250. 35570. 20000. 11250. 0632
+/u1D6FC/u1D45A/u1D44E/u1D465
+103
+104
+105
+106
+Lipschitz Constant
+ConvSmall
+Zonotope
+Interval
+Pasado
+0. 63250. 35570. 20000. 11250. 0632
+/u1D6FC/u1D45A/u1D44E/u1D465
+103
+104
+105
+106
+107 ConvMed
+0. 63250. 35570. 20000. 11250. 0632
+/u1D6FC/u1D45A/u1D44E/u1D465
+107
+109
+1011
+ConvBig
+(a) Average upper bounds on the local Lipschitz constants for the interval AD, zonotope AD, and Pasado.
+0. 63250. 35570. 20000. 11250. 0632
+/u1D6FC/u1D45A/u1D44E/u1D465
+10
+20
+30
+40
+50Lipschitz Constant Ratio
+ConvSmall
+0. 63250. 35570. 20000. 11250. 0632
+/u1D6FC/u1D45A/u1D44E/u1D465
+10
+20
+30
+40
+50
+ConvMed
+0. 63250. 35570. 20000. 11250. 0632
+/u1D6FC/u1D45A/u1D44E/u1D465
+0
+500
+1000
+1500
+2000
+ConvBig
+(b) Increase in precisions of Pasado over zonotope AD.
+Fig. 9. Lipschitz robustness of ConvSmall (le/f_t), ConvMed (center), and ConvBig (right) against the haze
+perturbation on 30 correctly classified test-set images. The top row (Fig. 9a) presents the average upper
+bounds on the local Lipschitz constant with respect to diﬀerent /u1D6FC/u1D45A/u1D44E/u1D465for the interval AD, zonotope AD, and
+Pasado. The bo/t_tom row (Fig. 9b) presents the increase in precision of the Pasado domain, computed as the
+ratio of the zonotope-bounded Lipschitz constant over the Pasado-bounded Lipschitz constant.
+the MLP’s output with respect to 5 continuous input features which are: Age, Education-Num,
+Capital Gain, Capital Loss, and Hours per week . Whereas prior work [ Shi et al . 2022] varied one
+feature at a time while holding the value of all other features as /f_ixed, our experiments allow
+all 5 of the aforementioned continuous features to simultaneously vary within interval bounds.
+Hence we abstractly interpret the continuous features with a 5D /u1D43F∞-ball, with a radius /u1D716∈[ 0, 1],
+while holding all the remaining features as /f_ixed. Since training data is normalized to have zero
+mean and unit variance, passing a 5D /u1D43F∞-ball with /u1D716= 0. 4 through the MLP is equivalent to
+exploring an in/f_inite set of inputs that satisfy Age∈[ 33. 2, 44. 1], Education-Num∈[ 9. 05, 11. 1],
+Capital Gain∈[− 1900, 4060], Capital Loss∈[− 73. 7, 249], and Hours per week∈[ 35. 5, 45. 4]. For
+this analysis, we used Pasado’s reverse-mode AD abstract transformers. Hence in a single (abstract)
+pass, Pasado computes bounds on the partial derivatives of the output with respect to each of the
+/f_ive input features.
+0.0 0.2 0.4 0.6 0.8
+/u1D43F∞-ball radius/u1D716
+0
+100
+200
+300
+400
+500# Verifiably Monotonic Features
+Interval
+Zonotope
+Pasado
+Fig. 10. Counts of verifiably monotonic fea-
+tures of Adult MLP over 100 test-set inputs.
+For each/u1D43F∞-ball radius/u1D716, Pasado abstractly computes
+bounds on the /f_ive partial derivatives when the origi-
+nal input is perturbed by the
+/u1D43F∞-ball for 100 diﬀerent
+inputs, computing 500 partial derivative bounds in to-
+tal. In addition, we compare Pasado against interval AD
+and zonotope AD. For a given input /u1D43F∞-ball, to verify
+monotonicity with respect to a chosen feature, the partial
+derivative bound with respect to that feature should prov-
+ably exclude 0, meaning the interval should be strictly
+positive (monotonically increasing) or strictly negative
+(monotonically decreasing). This condition ensures that
+the MLP is monotonic with respect to that feature for all
+Proc. ACM Program. Lang., Vol. 7, No. OOPSLA2, Article 291. Publication date: October 2023.
+Synthesizing Precise Static Analyzers for Automatic Diﬀerentiation 291:27
+input points in the given /u1D43F∞-ball. Hence in Fig. 10, we show the total number of partial derivative
+bounds that exclude 0 over 100 test inputs, for diﬀerent-sized /u1D43F∞-balls.
+Fig. 10 shows that the ability of interval AD to prove monotonicity sharply decreases for /u1D716≥ 0. 05
+due to the inherent imprecision of the interval domain. For small /u1D716such as 0≤/u1D716≤ 0. 2, zonotope
+AD and Pasado produce similar counts, meaning both can prove monotonicity. However, their
+respective performances diverge as /u1D716increases. When 0. 2≤/u1D716≤ 0. 6, the counts for zonotope AD
+decline rapidly to nearly zero, whereas the counts for Pasado remain high. Hence, in these cases
+Pasado can prove monotonicity in signi/f_icantly more instances. For/u1D716> 0. 6, all three analyses
+struggle to prove monotonicity for most continuous input features. The average runtimes for the
+interval AD, zonotope AD, and Pasado are 0. 079, 12, and 39 seconds, respectively. In summary,
+Pasado is able to prove the most monotonicity speci/f_ications across all inputs.
+6 RELATED WORK
+Composite and Synthesized Abstractions. The idea of abstracting a composite numeric expres-
+sion all at once (as Pasado does) to obtain better precision than sub-optimally composing individual
+abstract transformers for nonlinear primitives has emerged in the literature. While bene/f_icial for
+improving precision, abstracting composite expressions is challenging because soundly bounding a
+composite expression typically involves solving a nonconvex, multivariable optimization problem.
+As discussed in Fryazinov et al . [2010], these problems typically cannot be solved by hand due to
+the need to consider interior critical points (as Pasado does). Hence recent works [ Ko et al. 2019;
+Kochdumper et al . 2022; Paulsen and Wang 2022a ,b; Ryou et al . 2021; Singh et al . 2019a] have tried
+to synthesize precise composite abstractions by solving an optimization problem (using gradient
+methods or SMT solvers). However, none of these works target AD, thus none of these techniques
+can leverage the structure of an AD computation as Pasado does. Further, unlike [ Paulsen and
+Wang 2022a,b] we do not use an SMT solver, as we can solve our optimization problems directly.
+Abstract Interpretation of AD . Abstract interpretation has also been applied to AD [ Jordan
+and Dimakis 2021 ; Laurel et al . 2022a,b; Misra et al . 2023; Vassiliadis et al . 2016], however, all
+of these works use either the standard interval domain or standard zonotope domain abstract
+transformers, and compose them naively instead of jointly abstracting multiple AD operations
+as we do. Furthermore, [ Jordan and Dimakis 2021 ; Laurel et al. 2022a; Vassiliadis et al. 2016] are
+only formalized for a single abstract domain and thus cannot immediately produce general static
+analyzers for a more general set of abstract domains as Pasado can. While Laurel et al. [2022b] can
+be instantiated with diﬀerent abstract domains, that work uses standard abstract transformers and
+thus cannot dynamically synthesize new abstractions and only supports forward mode AD.
+7 CONCLUSION
+We present Pasado, the /f_irst technique for synthesizing precise static analyzers tailored speci/f_ically
+to Automatic Diﬀerentiation. We show the generality of Pasado by instantiating it for the Product
+Rule, Quotient Rule and Chain Rule patterns, with the latter supporting multiple diﬀerent non-linear
+functions. Pasado’s generality also extends to multiple diﬀerent abstract domains and both forward-
+mode and reverse-mode AD. Our evaluation on multiple challenging scenarios from machine
+learning and scienti/f_ic computing shows that Pasado signi/f_icantly improves precision compared to
+prior techniques while simultaneously oﬀering scalability to large computations including CNNs.
+ACKNOWLEDGEMENTS
+We thank the anonymous reviewers for their comments. This research was supported in part by
+NSF Grants No. CCF-1846354, CCF-1956374, CCF-2008883, CNS-2148583, CCF-2217144, and CCF-
+2238079, a gift from Meta, Google research scholar award, and aSloan UCEM Graduate Scholarship.
+Proc. ACM Program. Lang., Vol. 7, No. OOPSLA2, Article 291. Publication date: October 2023.
+291:28 Jacob Laurel, Siyuan Brant Qian, Gagandeep Singh, Sasa Misailovic
+DATA-A V AILABILITY STATEMENT
+In addition to the github repo https://github.com/uiuc-arc/Pasado, our software and documentation
+are also available on Zenodo [ Laurel et al. 2023b ].
+REFERENCES
+Assalé Adjé, Stéphane Gaubert, and Eric Goubault. 2010. Coupling Policy Iteration with Semi-de/f_inite Relaxation to Compute
+Accurate Numerical Invariants in Static Analysis. In European Symposium on Programming .
+Sai Praveen Bangaru, Jesse Michel, Kevin Mu, Gilbert Bernstein, Tzu-Mao Li, and Jonathan Ragan-Kelley. 2021. Systematically
+diﬀerentiating parametric discontinuities. ACM Transactions on Graphics (TOG) 40, 4 (2021).
+Barry Becker and Ronny Kohavi. 1996. Adult. UCI Machine Learning Repository. DOI: https://doi.org/10.24432/C5XW20.
+Claus Bendtsen and Ole Stauning. 1996. FADBAD, a /f_lexible C++ package for automatic diﬀerentiation. (1996).
+Patrick Cousot and Radhia Cousot. 1977. Abstract interpretation: a uni/f_ied lattice model for static analysis of programs by
+construction or approximation of /f_ixpoints. InProceedings of the 4th ACM SIGACT-SIGPLAN symposium on Principles of
+programming languages.
+Patrick Cousot and Nicolas Halbwachs. 1978. Automatic discovery of linear restraints among variables of a program. In
+Proceedings of the 5th ACM SIGACT-SIGPLAN symposium on Principles of programming languages .
+Tianyu Du, Shouling Ji, Lujia Shen, Yao Zhang, Jinfeng Li, Jie Shi, Chengfang Fang, Jianwei Yin, Raheem Beyah, and Ting
+Wang. 2021. Cert-RNN: Towards Certifying the Robustness of Recurrent Neural Networks.. In CCS.
+Oleg Fryazinov, Alexander Pasko, and Peter Comninos. 2010. Fast reliable interrogation of procedurally de/f_ined implicit
+surfaces using extended revised aﬃne arithmetic. Computers & Graphics 34, 6 (2010).
+Khalil Ghorbal, Eric Goubault, and Sylvie Putot. 2009. The zonotope abstract domain taylor1+. In International Conference
+on Computer Aided Veri/f_ication. 627–633.
+Andreas Griewank and Andrea Walther. 2008. Evaluating derivatives: principles and techniques of algorithmic diﬀerentiation .
+SIAM.
+Akhil Gupta, Lavanya Marla, Ruoyu Sun, Naman Shukla, and Arinbjörn Kolbeinsson. 2021. Pender: Incorporating shape
+constraints via penalized derivatives. In Proceedings of the AAAI Conference on Arti/f_icial Intelligence, Vol. 35.
+Thibault Helaire et al. 2021. aﬀapy library. (2021).
+Paul D Hovland, Boyana Norris, Michelle Mills Strout, Sanjukta Bhowmick, and Jean Utke. 2005. Sensitivity analysis and
+design optimization through automatic diﬀerentiation. In Journal of Physics: Conference Series .
+Jan Hückelheim and Laurent Hascoët. 2022. Automatic diﬀerentiation of parallel loops with formal methods. In Proceedings
+of the 51st International Conference on Parallel Processing .
+Jan Hückelheim, Ziqing Luo, Sri Hari Krishna Narayanan, Stephen Siegel, and Paul D Hovland. 2018. Verifying Properties
+of Diﬀerentiable Programs. In International Static Analysis Symposium . 205–222.
+Matt Jordan and Alex Dimakis. 2021. Provable Lipschitz certi/f_ication for generative models. In International Conference on
+Machine Learning. PMLR, 5118–5126.
+Matt Jordan and Alexandros G Dimakis. 2020. Exactly computing the local lipschitz constant of relu networks. Advances in
+Neural Information Processing Systems (2020).
+Hans Kaper and Hans Engler. 2013. Mathematics and climate. SIAM.
+Andrej Karpathy et al. 2020. micrograd library. (2020).
+John Kitchin. 2018. A diﬀerentiable ODE integrator for sensitivity analysis. (2018).
+Ching-Yun Ko, Zhaoyang Lyu, Lily Weng, Luca Daniel, Ngai Wong, and Dahua Lin. 2019. POPQORN: Quantifying robustness
+of recurrent neural networks. In International Conference on Machine Learning . PMLR, 3468–3477.
+Niklas Kochdumper, Christian Schilling, Matthias Althoﬀ, and Stanley Bak. 2022. Open-and closed-loop neural network
+veri/f_ication using polynomial zonotopes.arXiv preprint arXiv:2207.02715 (2022).
+Jacob Laurel, Siyuan Brant Qian, Gagandeep Singh, and Sasa Misailovic. 2023a. Appendix for Synthesizing Precise Static
+Analyzers for Automatic Diﬀerentiation. (2023). https://jsl1994.github.io/papers/OOPSLA2023_appendix.pdf
+Jacob Laurel, Siyuan Brant Qian, Gagandeep Singh, and Sasa Misailovic. 2023b. Artifact for Synthesizing Precise Static
+Analyzers for Automatic Diﬀerentiation. (2023). https://doi.org/10.5281/zenodo.8332724
+Jacob Laurel, Rem Yang, Gagandeep Singh, and Sasa Misailovic. 2022a. A Dual Number Abstraction for Static Analysis of
+Clarke Jacobians. Proceedings of the ACM on Programming Languages POPL (2022), 1–30.
+Jacob Laurel, Rem Yang, Shubham Ugare, Robert Nagel, Gagandeep Singh, and Sasa Misailovic. 2022b. A general construction
+for abstract interpretation of higher-order automatic diﬀerentiation. Proceedings of the ACM on Programming Languages
+6, OOPSLA2 (2022), 1007–1035.
+Samuel Lerman, Charles Venuto, Henry Kautz, and Chenliang Xu. 2021. Explaining Local, Global, And Higher-Order
+Interactions In Deep Learning. In Proceedings of the IEEE/CVF International Conference on Computer Vision . 1224–1233.
+Proc. ACM Program. Lang., Vol. 7, No. OOPSLA2, Article 291. Publication date: October 2023.
+Synthesizing Precise Static Analyzers for Automatic Diﬀerentiation 291:29
+Yingbo Ma, Vaibhav Dixit, Michael J Innes, Xingjian Guo, and Chris Rackauckas. 2021. A comparison of automatic
+diﬀerentiation and continuous sensitivity analysis for derivatives of diﬀerential equation solutions. In 2021 IEEE High
+Performance Extreme Computing Conference (HPEC) . IEEE, 1–9.
+Azamat Mametjanov, Boyana Norris, Xiaoyan Zeng, Beth Drewniak, Jean Utke, Mihai Anitescu, and Paul Hovland. 2012.
+Applying automatic diﬀerentiation to the Community Land Model. In Recent Advances in Algorithmic Diﬀerentiation .
+Antoine Miné. 2004. Relational abstract domains for the detection of /f_loating-point run-time errors. In European Symposium
+on Programming. 3–17.
+Ashitabh Misra, Jacob Laurel, and Sasa Misailovic. 2023. ViX: Analysis-driven Compiler for Eﬃcient Low-Precision
+Variational Inference. In Design, Automation & Test in Europe Conference & Exhibition (DATE) .
+Adam Paszke, Sam Gross, Francisco Massa, Adam Lerer, James Bradbury, Gregory Chanan, Trevor Killeen, Zeming Lin,
+Natalia Gimelshein, Luca Antiga, et al . 2019. Pytorch: An imperative style, high-performance deep learning library.
+Advances in neural information processing systems 32 (2019).
+Brandon Paulsen and Chao Wang. 2022a. Example Guided Synthesis of Linear Approximations for Neural Network
+Veri/f_ication. InInternational Conference on Computer Aided Veri/f_ication.
+Brandon Paulsen and Chao Wang. 2022b. LinSyn: Synthesizing Tight Linear Bounds for Arbitrary Neural Network Activation
+Functions. In International Conference on Tools and Algorithms for the Construction and Analysis of Systems . 357–376.
+Harrison Rosenberg, Brian Tang, Kassem Fawaz, and Somesh Jha. 2023. Fairness properties of face recognition and
+obfuscation systems. In 32nd USENIX Security Symposium (USENIX Security 23) .
+Wonryong Ryou, Jiayu Chen, Mislav Balunovic, Gagandeep Singh, Andrei Dan, and Martin Vechev. 2021. Scalable polyhedral
+veri/f_ication of recurrent neural networks. InInternational Conference on Computer Aided Veri/f_ication. 225–248.
+Andrea Saltelli, Marco Ratto, Stefano Tarantola, and Francesca Campolongo. 2005. Sensitivity analysis for chemical models.
+Chemical reviews 105, 7 (2005), 2811–2828.
+Zhouxing Shi, Yihan Wang, Huan Zhang, Zico Kolter, and Cho-Jui Hsieh. 2022. Eﬃciently Computing Local Lipschitz
+Constants of Neural Networks via Bound Propagation. In Advances in Neural Information Processing Systems .
+Zhouxing Shi, Huan Zhang, Kai-Wei Chang, Minlie Huang, and Cho-Jui Hsieh. 2020. Robustness Veri/f_ication for Transformers.
+In ICLR.
+Gagandeep Singh, Rupanshu Ganvir, Markus Püschel, and Martin Vechev. 2019a. Beyond the single neuron convex barrier
+for neural network certi/f_ication.Advances in Neural Information Processing Systems 32 (2019).
+Gagandeep Singh, Timon Gehr, Matthew Mirman, Markus Püschel, and Martin T Vechev. 2018. Fast and Eﬀective Robustness
+Certi/f_ication.NeurIPS 1, 4 (2018), 6.
+Gagandeep Singh, Timon Gehr, Markus Püschel, and Martin Vechev. 2019b. An abstract domain for certifying neural
+networks. Proceedings of the ACM on Programming Languages 3, POPL (2019), 1–30.
+Gagandeep Singh, Timon Gehr, Markus Püschel, and Martin Vechev. 2019c. Boosting robustness certi/f_ication of neural
+networks. In International conference on learning representations .
+Gagandeep Singh, Markus Püschel, and Martin Vechev. 2017. Fast polyhedra abstract domain. In Proceedings of the 44th
+ACM SIGPLAN Symposium on Principles of Programming Languages .
+Aishwarya Sivaraman, Golnoosh Farnadi, Todd Millstein, and Guy Van den Broeck. 2020. Counterexample-guided learning
+of monotonic neural networks. Neural Information Processing Systems (2020).
+Jorge Stol/f_i and Luiz Henrique De Figueiredo. 1997. Self-validated numerical methods and applications. In Monograph for
+21st Brazilian Mathematics Colloquium, IMPA, Rio de Janeiro. Citeseer , Vol. 5. Citeseer.
+James Paul Turner. 2020. Analysing and Bounding Numerical Error in Spiking Neural Network Simulations . Ph. D. Dissertation.
+University of Sussex.
+Vassilis Vassiliadis, Jan Riehme, Jens Deussen, Konstantinos Parasyris, Christos D Antonopoulos, Nikolaos Bellas, Spyros
+Lalis, and Uwe Naumann. 2016. Towards automatic signi/f_icance analysis for approximate computing. In2016 IEEE/ACM
+International Symposium on Code Generation and Optimization (CGO) . IEEE.
+James Walsh. 2015. Climate modeling in diﬀerential equations. The UMAP Journal 36, 4 (2015), 325–363.
+Yu Wang, Qitong Gao, and Miroslav Pajic. 2022. Learning Monotone Dynamics by Neural Networks. In 2022 American
+Control Conference (ACC). IEEE, 1485–1490.
+Yuting Yang, Connelly Barnes, Andrew Adams, and Adam Finkelstein. 2022. A/u1D6FF: autodiﬀ for discontinuous programs-applied
+to shaders. ACM Transactions on Graphics (TOG) 41, 4 (2022).
+Proc. ACM Program. Lang., Vol. 7, No. OOPSLA2, Article 291. Publication date: October 2023.

@@ -1,0 +1,13 @@
+# Ugnježdeni git repoi - kloniraju se posebno (vidi MAC_SETUP.md)
+/Pasado/
+/neptune/
+/Local-Lipschitz-Constants/
+/lipschitz-comparison/auto_LiRPA_src/
+
+# Python okruženja i keš (prave se ponovo na novoj mašini)
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.egg-info/
+.ipynb_checkpoints/

@@ -1,0 +1,17 @@
+with quantize.qconfig(
+    nbit_input=8, dtype_input="uint8",     # ← unsigned!
+    nbit_weight=8, dtype_weight="int8",
+    nbit_activation=32, dtype_activation="int32",
+    calibrate_mode="global_scale", global_scale=8.0,
+    skip_dense_layer=True, skip_conv_layers=[0],
+):
+    modu8 = quantize.quantize(mod, params=params)
+
+with tvm.transform.PassContext(opt_level = 3):
+    libu8 = relay.build(modu8, target = target, params = params)
+
+# execute the graph on TVM
+mu8 = graph_executor.GraphModule(libu8["default"](dev))
+mu8.set_input(input_name, tvm.nd.array(img.astype("float32")))
+timingu8 = mu8.benchmark(dev, number=100)
+print("uint8:    ", timingu8)
