@@ -1,0 +1,1185 @@
+diff --git a/experiments/colab_bab_sweep.py b/experiments/colab_bab_sweep.py
+new file mode 100644
+index 0000000..da768a9
+--- /dev/null
++++ b/experiments/colab_bab_sweep.py
+@@ -0,0 +1,249 @@
++"""auto_LiRPA + Branch-and-Bound swept over networks x epsilons x budgets, on GPU.
++
++Establishes where the equal-budget crossover with Pasado sits across the whole
++benchmark, not just at the one point measured so far (5layer, eps=0.2, crossover
++at ~7 subproblems). That point was the most favourable one for Pasado -- it is
++where the single-pass gap peaked -- so the crossover elsewhere is expected to be
++at a smaller budget, and this sweep is what shows it.
++
++Only the auto_LiRPA side runs here. The Pasado side is a CPU job
++(`get_lipschitz.py --n-splits k`, cheap) and is merged afterwards; keeping them
++apart avoids running Pasado's float64 CPU code inside a CUDA-default process.
++
++Design notes that matter:
++
++* **Best-first bisection.** t in [0, eps] is the whole perturbed domain (a
++  scalar), so bisecting it is complete branching; there are no ReLU neurons to
++  split in a sigmoid network. At each step the sub-interval with the largest
++  current bound is split, since only that one can hold the global max. The
++  running max over live sub-intervals is sound at every budget, so one pass
++  yields the whole curve.
++
++* **Fresh module per solve.** auto_LiRPA caches intermediate bounds and alpha
++  parameters per call and never frees them; the bound graph is a reference
++  cycle, so `gc.collect()` is required and `empty_cache()` alone is a no-op.
++  Without this an 80 GB A100 fills after six solves.
++
++* **Resumable.** Colab sessions die. Every (network, epsilon) result is appended
++  to the CSV as soon as it completes, and a rerun skips pairs already present,
++  so progress survives a disconnect.
++
++Colab:
++    !git clone https://github.com/uiuc-arc/Pasado.git
++    !mkdir -p Pasado/experiments
++    !pip install -q --ignore-requires-python git+https://github.com/Verified-Intelligence/auto_LiRPA.git
++    !wget -q -O Pasado/experiments/sweep.py \\
++      https://raw.githubusercontent.com/dimitrijepesic/Pasado/colab-gpu-wip/experiments/colab_bab_sweep.py
++    !python Pasado/experiments/sweep.py --networks 3layer 4layer 5layer --eps-indices 0 1 2 3 4 5 6
++"""
++import argparse
++import csv
++import gc
++import os
++import time
++
++import torch
++import torch.nn as nn
++
++torch.set_default_dtype(torch.float64)
++
++EPSILONS = [10 ** (-k / 4) * 2 for k in range(2, 18)]
++
++
++def find_section_5_4():
++    here = os.path.dirname(os.path.abspath(__file__))
++    for cand in (os.path.join(here, "..", "Section_5_4"),
++                 os.path.join(os.getcwd(), "Pasado", "Section_5_4"),
++                 os.path.join(os.getcwd(), "Section_5_4")):
++        if os.path.isdir(cand):
++            return os.path.normpath(cand)
++    raise FileNotFoundError("Section_5_4 not found; clone uiuc-arc/Pasado first")
++
++
++SEC = find_section_5_4()
++
++
++def build_network(name):
++    if name == "big":
++        net = nn.Sequential(
++            nn.Flatten(),
++            nn.Linear(784, 1024), nn.Sigmoid(),
++            nn.Linear(1024, 1024), nn.Sigmoid(),
++            nn.Linear(1024, 1024), nn.Sigmoid(),
++            nn.Linear(1024, 1024), nn.Sigmoid(),
++            nn.Linear(1024, 10),
++        )
++        net.load_state_dict(torch.load(
++            os.path.join(SEC, "trained", f"model_{name}.pth"), map_location="cpu"))
++    else:
++        depth = {"3layer": 3, "4layer": 4, "5layer": 5}[name]
++        mods = [nn.Flatten(), nn.Linear(784, 100), nn.Sigmoid(),
++                nn.Linear(100, 100), nn.Sigmoid()]
++        if depth >= 4:
++            mods += [nn.Linear(100, 100), nn.Sigmoid()]
++        if depth == 5:
++            mods += [nn.Linear(100, 100), nn.Sigmoid()]
++        mods += [nn.Linear(100, 10)]
++        net = nn.Sequential(*mods)
++        state = torch.load(os.path.join(SEC, "trained", f"model_{name}.pth"),
++                           map_location="cpu")
++        lin_idx = [i for i, m in enumerate(net) if isinstance(m, nn.Linear)]
++        fc = ["fc1", "fc2", "fc3", "fc4"][:len(lin_idx) - 1] + ["fc_final"]
++        net.load_state_dict({f"{i}.{p}": state[f"{f_}.{p}"]
++                             for i, f_ in zip(lin_idx, fc)
++                             for p in ("weight", "bias")})
++    return net.to(torch.float64).eval()
++
++
++def load_test_images():
++    import torchvision
++    import torchvision.transforms as T
++    return torchvision.datasets.MNIST(
++        root=os.path.join(SEC, "MNIST_Data"), train=False, download=True,
++        transform=T.ToTensor())
++
++
++class HazeJacobian(nn.Module):
++    """dF/dt for x(t) = img + t*(1 - img) -- exactly Pasado's Section 5.4 quantity."""
++
++    def __init__(self, net):
++        super().__init__()
++        self.net = net
++
++    def forward(self, t, img):
++        from auto_LiRPA.jacobian import JacobianOP
++        return JacobianOP.apply(self.net(img + t * (1.0 - img)), t)
++
++
++def solve_interval(network, img, t_lo, t_hi, dev):
++    from auto_LiRPA import BoundedModule, BoundedTensor
++    from auto_LiRPA.perturbations import PerturbationLpNorm
++
++    center, radius = (t_lo + t_hi) / 2.0, (t_hi - t_lo) / 2.0
++    # Rebuilding the net too, not just the BoundedModule: tracing attaches bound
++    # state to the traced modules, so a shared net keeps old graphs reachable.
++    model = BoundedModule(HazeJacobian(build_network(network).to(dev)),
++                          (torch.zeros(1, 1, device=dev), img), device=dev)
++    bt = BoundedTensor(torch.full((1, 1), center, device=dev),
++                       PerturbationLpNorm(norm=float("inf"), eps=radius))
++    lb, ub = model.compute_jacobian_bounds((bt, img))
++    out = torch.maximum(lb.abs(), ub.abs()).max().item()
++    del model, lb, ub
++    gc.collect()
++    if dev == "cuda":
++        torch.cuda.empty_cache()
++    return out
++
++
++def bab_curve(network, img, eps, budget, dev):
++    """{solves_used: bound} for best-first bisection of t in [0, eps]."""
++    b0 = solve_interval(network, img, 0.0, eps, dev)
++    domains = [(b0, 0.0, eps)]
++    curve, solves = {1: b0}, 1
++    while solves + 2 <= budget:
++        i = max(range(len(domains)), key=lambda k: domains[k][0])
++        _, lo, hi = domains.pop(i)
++        mid = (lo + hi) / 2.0
++        domains.append((solve_interval(network, img, lo, mid, dev), lo, mid))
++        domains.append((solve_interval(network, img, mid, hi, dev), mid, hi))
++        solves += 2
++        curve[solves] = max(d[0] for d in domains)
++    return curve
++
++
++FIELDS = ["network", "eps_index", "epsilon", "solves", "images_averaged",
++          "lirpa_bab", "pasado_precise_1_solve", "seconds_per_image"]
++
++
++def load_done(path):
++    """(network, eps_index) pairs already finished, so a rerun resumes."""
++    if not os.path.exists(path):
++        return set(), []
++    with open(path, newline="") as f:
++        rows = list(csv.DictReader(f))
++    return {(r["network"], int(r["eps_index"])) for r in rows}, rows
++
++
++def main():
++    ap = argparse.ArgumentParser()
++    ap.add_argument("--networks", nargs="+", default=["3layer", "4layer", "5layer"],
++                    choices=["3layer", "4layer", "5layer", "big"])
++    # Indices 7..15 are omitted by default: there every method has converged and
++    # the ratio is flat at ~1, so they cost time without carrying information.
++    ap.add_argument("--eps-indices", nargs="+", type=int,
++                    default=[0, 1, 2, 3, 4, 5, 6])
++    ap.add_argument("--budget", type=int, default=9,
++                    help="max solves per image; schedule is 1,3,5,...")
++    ap.add_argument("--num-images", type=int, default=30)
++    ap.add_argument("--out", default="bab_sweep.csv")
++    ap.add_argument("--device",
++                    default="cuda" if torch.cuda.is_available() else "cpu")
++    args = ap.parse_args()
++
++    if args.num_images != 30:
++        print(f"\n*** WARNING: --num-images {args.num_images} != 30. Pasado's "
++              f"reference numbers are 30-image averages, so ratios computed "
++              f"against them will not be comparable. ***\n", flush=True)
++
++    dev = args.device
++    print(f"device={dev}" + (f" ({torch.cuda.get_device_name(0)})"
++                             if dev == "cuda" else ""))
++    ds = load_test_images()
++    done, rows = load_done(args.out)
++    if done:
++        print(f"resuming: {len(done)} (network, eps) pairs already in {args.out}")
++
++    schedule = list(range(1, args.budget + 1, 2))
++
++    for network in args.networks:
++        correct = set(int(i) for i in torch.load(
++            os.path.join(SEC, "trained", f"indices_{network}.pth"),
++            map_location="cpu"))
++        selected = [i for i in range(len(ds)) if i in correct][:args.num_images]
++        ref_path = os.path.join(SEC, "results", f"lc_precise_{network}.pth")
++        ref = torch.load(ref_path, map_location="cpu") if os.path.exists(ref_path) else None
++
++        for ei in args.eps_indices:
++            if (network, ei) in done:
++                print(f"skip {network} eps_index={ei} (already done)")
++                continue
++            eps = EPSILONS[ei]
++            sums = {k: 0.0 for k in schedule}
++            begin = time.perf_counter()
++
++            for img_no, idx in enumerate(selected, start=1):
++                img = ds[idx][0].flatten().unsqueeze(0).to(torch.float64).to(dev)
++                curve = bab_curve(network, img, eps, args.budget, dev)
++                for k in schedule:
++                    sums[k] += curve[k]
++                if img_no % 10 == 0:
++                    print(f"  {network} eps={eps:.5g}: {img_no}/{len(selected)} "
++                          f"images, K=1 {sums[1]/img_no:.4g} -> "
++                          f"K={schedule[-1]} {sums[schedule[-1]]/img_no:.4g}",
++                          flush=True)
++
++            secs = (time.perf_counter() - begin) / len(selected)
++            pas = ref[ei] if ref else None
++            new = [{
++                "network": network, "eps_index": ei, "epsilon": eps,
++                "solves": k, "images_averaged": len(selected),
++                "lirpa_bab": sums[k] / len(selected),
++                "pasado_precise_1_solve": pas,
++                "seconds_per_image": secs,
++            } for k in schedule]
++            rows.extend(new)
++            # Appended as soon as the pair finishes, so a dead session costs at
++            # most the pair in flight.
++            with open(args.out, "w", newline="") as f:
++                w = csv.DictWriter(f, fieldnames=FIELDS)
++                w.writeheader()
++                w.writerows(rows)
++
++            summary = "  ".join(f"K={r['solves']}:{r['lirpa_bab']:.4g}" for r in new)
++            print(f"[{network} eps={eps:.5g}] {secs:.1f}s/img  {summary}", flush=True)
++
++    print(f"\nwrote {args.out}")
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/experiments/colab_compare_pasado_lirpa.py b/experiments/colab_compare_pasado_lirpa.py
+new file mode 100644
+index 0000000..911a526
+--- /dev/null
++++ b/experiments/colab_compare_pasado_lirpa.py
+@@ -0,0 +1,241 @@
++"""Colab/GPU port of the Pasado-vs-auto_LiRPA local-Lipschitz comparison.
++
++Why this exists as a separate script. The comparison runs fine locally for the
++100-wide networks (3/4/5layer), but not for FFNNBig (1024-wide): auto_LiRPA's
++Jacobian path calls _expand_jacobian, which explicitly turns OFF every sparse
++option --
++
++    # auto_LiRPA/jacobian.py, _expand_jacobian
++    if self.jacobian_start_nodes:
++        # Disable unstable options
++        self.bound_opts.update({
++            'sparse_intermediate_bounds': False,
++            'sparse_conv_intermediate_bounds': False,
++            'sparse_intermediate_bounds_with_ibp': False,
++            'sparse_features_alpha': False,
++            'sparse_spec_alpha': False,
++        })
++
++-- so intermediate bounds are computed against dense 1024x1024 identity specs
++(the library itself warns: "Creating an identity matrix with size 1024x1024 ...
++This may indicate poor performance"). One solve peaks near 10.7 GB, and the
++memory is never returned to the OS, so a 15.7 GB laptop cannot do two solves in
++one process and barely does one. An A100 (80 GB) has room.
++
++What is compared. Pasado Section 5.4 bounds dF/dt for the haze family
++x(t) = img + t*(1-img), t in [0, eps], reporting
++max_j max(|lb_j|, |ub_j|) averaged over 30 correctly-classified test images.
++We express the same haze map inside the model and ask auto_LiRPA for the
++Jacobian w.r.t. the scalar t, which is exactly dF/dt -- same quantity, no
++conversion factor.
++
++Fairness notes: auto_LiRPA runs its default optimize=True (CROWN-Optimized),
++its strongest standard mode; float64 throughout, matching Pasado. Runtime is
++NOT comparable here (their GPU vs Pasado's CPU) -- tightness is the metric.
++
++Colab usage:
++    !git clone https://github.com/uiuc-arc/Pasado.git
++    !pip install git+https://github.com/Verified-Intelligence/auto_LiRPA.git
++    !python Pasado/experiments/colab_compare_pasado_lirpa.py --network big
++"""
++import argparse
++import csv
++import gc
++import os
++import time
++
++import torch
++import torch.nn as nn
++
++torch.set_default_dtype(torch.float64)
++
++EPSILONS = [10 ** (-k / 4) * 2 for k in range(2, 18)]
++
++
++def find_pasado_root():
++    """Locate Section_5_4 whether we're run from inside the repo or beside it."""
++    here = os.path.dirname(os.path.abspath(__file__))
++    for cand in (os.path.join(here, "..", "Section_5_4"),
++                 os.path.join(os.getcwd(), "Pasado", "Section_5_4"),
++                 os.path.join(os.getcwd(), "Section_5_4")):
++        if os.path.isdir(cand):
++            return os.path.normpath(cand)
++    raise FileNotFoundError("Section_5_4 not found; clone uiuc-arc/Pasado first")
++
++
++SEC = find_pasado_root()
++
++
++def build_network(name):
++    if name == "big":
++        net = nn.Sequential(
++            nn.Flatten(),
++            nn.Linear(784, 1024), nn.Sigmoid(),
++            nn.Linear(1024, 1024), nn.Sigmoid(),
++            nn.Linear(1024, 1024), nn.Sigmoid(),
++            nn.Linear(1024, 1024), nn.Sigmoid(),
++            nn.Linear(1024, 10),
++        )
++        net.load_state_dict(torch.load(
++            os.path.join(SEC, "trained", f"model_{name}.pth"),
++            map_location="cpu"))
++    else:
++        layers = {"3layer": 3, "4layer": 4, "5layer": 5}[name]
++        mods = [nn.Flatten(), nn.Linear(784, 100), nn.Sigmoid(),
++                nn.Linear(100, 100), nn.Sigmoid()]
++        if layers >= 4:
++            mods += [nn.Linear(100, 100), nn.Sigmoid()]
++        if layers == 5:
++            mods += [nn.Linear(100, 100), nn.Sigmoid()]
++        mods += [nn.Linear(100, 10)]
++        net = nn.Sequential(*mods)
++        state = torch.load(os.path.join(SEC, "trained", f"model_{name}.pth"),
++                           map_location="cpu")
++        seq_linears = [i for i, m in enumerate(net) if isinstance(m, nn.Linear)]
++        fc_names = ["fc1", "fc2", "fc3", "fc4"][:len(seq_linears) - 1] + ["fc_final"]
++        net.load_state_dict({
++            f"{i}.{p}": state[f"{fc}.{p}"]
++            for i, fc in zip(seq_linears, fc_names) for p in ("weight", "bias")})
++    return net.to(torch.float64).eval()
++
++
++def load_mnist_test():
++    """torchvision on Colab; ToTensor() == raw uint8 / 255, same as Pasado."""
++    import torchvision
++    import torchvision.transforms as T
++    ds = torchvision.datasets.MNIST(
++        root=os.path.join(SEC, "MNIST_Data"), train=False, download=True,
++        transform=T.ToTensor())
++    return ds
++
++
++class HazeJacobian(nn.Module):
++    """t is the perturbed scalar; img rides along unperturbed."""
++
++    def __init__(self, net):
++        super().__init__()
++        self.net = net
++
++    def forward(self, t, img):
++        from auto_LiRPA.jacobian import JacobianOP
++        x = img + t * (1.0 - img)
++        return JacobianOP.apply(self.net(x), t)
++
++
++def main():
++    from auto_LiRPA import BoundedModule, BoundedTensor
++    from auto_LiRPA.perturbations import PerturbationLpNorm
++
++    ap = argparse.ArgumentParser()
++    ap.add_argument("--network", default="big",
++                    choices=["3layer", "4layer", "5layer", "big"])
++    ap.add_argument("--num-images", type=int, default=30)
++    ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
++    args = ap.parse_args()
++
++    dev = args.device
++    print(f"device={dev}"
++          + (f" ({torch.cuda.get_device_name(0)}, "
++             f"{torch.cuda.get_device_properties(0).total_memory/2**30:.0f} GiB)"
++             if dev == "cuda" else ""))
++
++    net = build_network(args.network).to(dev)
++    ds = load_mnist_test()
++    correct = set(int(i) for i in torch.load(
++        os.path.join(SEC, "trained", f"indices_{args.network}.pth"),
++        map_location="cpu"))
++    selected = [i for i in range(len(ds)) if i in correct][:args.num_images]
++
++    # The saved Pasado numbers are averages over exactly 30 images
++    # (get_lipschitz.py: num_images_to_test = 30, break at correct_images == 30).
++    # Averaging auto_LiRPA over a different number of images compares a
++    # k-image mean against a 30-image mean -- not the same quantity, and the
++    # difference is large: image 0 alone has an exact |dF/dt| of 245.2 on
++    # `big`, well above the 30-image precise average of 168.1. Only --num-images
++    # 30 yields a valid ratio.
++    if args.num_images != 30:
++        print(f"\n*** WARNING: --num-images {args.num_images} != 30. The saved "
++              f"Pasado values are 30-image averages, so the printed ratios are "
++              f"NOT apples-to-apples and must not be reported. Use 30. ***\n",
++              flush=True)
++
++    def saved(kind):
++        p = os.path.join(SEC, "results", f"{kind}_{args.network}.pth")
++        return torch.load(p, map_location="cpu") if os.path.exists(p) else None
++    ref = {k: saved(k) for k in
++           ("lc_intervals", "lc_zonos", "lc_precise", "time_precise")}
++
++    out_path = os.path.join(os.getcwd(), f"results_{args.network}_colab.csv")
++    lc_sums = [0.0] * len(EPSILONS)
++    t_sums = [0.0] * len(EPSILONS)
++    counts = [0] * len(EPSILONS)
++
++    for img_no, idx in enumerate(selected, start=1):
++        img = ds[idx][0].flatten().unsqueeze(0).to(torch.float64).to(dev)
++        for ei, eps in enumerate(EPSILONS):
++            # Fresh module per (image, epsilon). BoundedModule accumulates
++            # cached intermediate bounds and alpha parameters on every
++            # compute_jacobian_bounds call and never releases them; with the
++            # sparse options force-disabled on the Jacobian path (see the
++            # module docstring) that is ~10 GB per call on `big`. Reusing one
++            # module across epsilons is what OOM-killed the 16 GB local runs,
++            # and 16 accumulated calls would threaten even an 80 GB A100.
++            # A fresh network too, not just a fresh BoundedModule: tracing
++            # attaches bound state to the traced modules, so reusing one `net`
++            # across pairs keeps every previous solve's graph reachable.
++            model = BoundedModule(HazeJacobian(build_network(args.network).to(dev)),
++                                  (torch.zeros(1, 1, device=dev), img),
++                                  device=dev)
++            t0 = torch.full((1, 1), eps / 2, device=dev)
++            bt = BoundedTensor(t0, PerturbationLpNorm(
++                norm=float("inf"), eps=eps / 2))
++            if dev == "cuda":
++                torch.cuda.synchronize()
++            begin = time.perf_counter()
++            lb, ub = model.compute_jacobian_bounds((bt, img))
++            if dev == "cuda":
++                torch.cuda.synchronize()
++            t_sums[ei] += time.perf_counter() - begin
++            lc_sums[ei] += torch.maximum(lb.abs(), ub.abs()).max().item()
++            counts[ei] += 1
++            # gc.collect() before empty_cache(), and both are needed: the bound
++            # graph is a cycle of nodes referencing each other, so plain
++            # refcounting never frees it and empty_cache() only returns blocks
++            # already freed. Without the collect, an 80 GB A100 filled up after
++            # six solves (76 GiB still live).
++            del model, lb, ub
++            gc.collect()
++            if dev == "cuda":
++                torch.cuda.empty_cache()
++            print(f"  img {img_no} eps={eps:.6f} "
++                  f"lirpa={lc_sums[ei]/counts[ei]:.6g} "
++                  f"({t_sums[ei]/counts[ei]:.1f}s avg)", flush=True)
++
++        rows = [{
++            "epsilon": e,
++            "images_averaged": counts[k],
++            "pasado_interval": ref["lc_intervals"][k] if ref["lc_intervals"] else None,
++            "pasado_zono": ref["lc_zonos"][k] if ref["lc_zonos"] else None,
++            "pasado_precise": ref["lc_precise"][k] if ref["lc_precise"] else None,
++            "lirpa_opt": lc_sums[k] / counts[k],
++            "pasado_time_precise": ref["time_precise"][k] if ref["time_precise"] else None,
++            "lirpa_time": t_sums[k] / counts[k],
++        } for k, e in enumerate(EPSILONS)]
++        with open(out_path, "w", newline="") as f:
++            w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
++            w.writeheader()
++            w.writerows(rows)
++
++        print(f"--- image {img_no}/{len(selected)} ---", flush=True)
++        for r in rows:
++            pp = r["pasado_precise"]
++            ratio = (r["lirpa_opt"] / pp) if pp else float("nan")
++            print(f"  eps={r['epsilon']:.6f}  precise={pp:.6g}  "
++                  f"lirpa={r['lirpa_opt']:.6g}  ratio={ratio:.3f}  "
++                  f"t={r['lirpa_time']:.2f}s", flush=True)
++
++    print(f"\nwrote {out_path}")
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/experiments/colab_compile_boundary.py b/experiments/colab_compile_boundary.py
+new file mode 100644
+index 0000000..400b43d
+--- /dev/null
++++ b/experiments/colab_compile_boundary.py
+@@ -0,0 +1,216 @@
++"""Does fusing check_nonlinear_boundary_tensor pay for the real cubic's 8 %?
++
++Context. After the grid was batched, `check_nonlinear_boundary_tensor` is the
++largest addressable block in the precise path (38 % of
++sigmoid_prime_product_tensor on 5layer). It was previously uncompilable: its
++root solve went through complex64, which TorchInductor cannot codegen. The
++PASADO_REAL_CUBIC path removes that, at a measured cost of +8 % on the precise
++transformer (acos + 3 cos are dearer than complex sqrt + pow).
++
++So the question is a threshold, not a direction: **fusion must recover more than
++the 8 % the real solver gives up**, otherwise the combination is a net loss.
++
++This measures four variants of the same kernel:
++
++    eager   + complex64   (production today)
++    eager   + real cubic  (the 8 % penalty, alone)
++    compile + complex64   (expected to FAIL -- documents the blocker)
++    compile + real cubic  (the point of the exercise)
++
++Reported per variant: median steady-state time, and for compiled variants the
++first-call compile latency separately -- a fused kernel that needs 30 s to
++compile is useless inside an analysis that runs it 1920 times for 20 s of work.
++
++Why a microbenchmark and not the full benchmark. torch.compile pays its cost
++once and amortizes; running get_lipschitz.py end to end mixes that with the
++interval/zonotope passes and data loading, which this change cannot affect. The
++kernel is timed in isolation at the shapes the real analysis uses (n = layer
++width), then the end-to-end effect is inferred from the profile share.
++
++Colab:
++    !git clone https://github.com/uiuc-arc/Pasado.git
++    !wget -q -O Pasado/forward_mode_tensorized_src/precise_transformer.py \\
++      https://raw.githubusercontent.com/dimitrijepesic/Pasado/colab-gpu-wip/forward_mode_tensorized_src/precise_transformer.py
++    !wget -q -O Pasado/experiments/compile_boundary.py \\
++      https://raw.githubusercontent.com/dimitrijepesic/Pasado/colab-gpu-wip/experiments/colab_compile_boundary.py
++    !pip install -q scikit-learn
++    !python Pasado/experiments/compile_boundary.py
++"""
++import argparse
++import os
++import statistics
++import sys
++import time
++import traceback
++
++import torch
++
++torch.set_default_dtype(torch.float64)
++
++
++def find_src():
++    here = os.path.dirname(os.path.abspath(__file__))
++    for cand in (os.path.join(here, "..", "forward_mode_tensorized_src"),
++                 os.path.join(os.getcwd(), "Pasado", "forward_mode_tensorized_src"),
++                 os.path.join(os.getcwd(), "forward_mode_tensorized_src")):
++        if os.path.isdir(cand):
++            return os.path.normpath(cand)
++    raise FileNotFoundError("forward_mode_tensorized_src not found")
++
++
++sys.path.insert(0, find_src())
++import precise_transformer as pt  # noqa: E402
++
++
++def make_inputs(n, device, regime, seed=1234):
++    """Boxes and planes shaped like a real sigmoid layer's inputs.
++
++    `regime` matters more than it looks. check_nonlinear_boundary_tensor divides
++    A by ly/uy and keeps only quotients inside the image of sigma''
++    (|.| < 1/(6*sqrt3)); everything else becomes NaN *before* the cubic solve.
++    So the fraction of live candidates decides which arithmetic the root solver
++    actually executes, and transcendental functions can be markedly slower on
++    NaN operands than on ordinary ones.
++
++    An early version of this script only generated the "in_image" regime (A
++    scaled so most quotients are live) and reported the real cubic as 1.54x
++    FASTER, while the end-to-end run had measured it 8 % SLOWER. Both regimes are
++    therefore measured, and the disagreement is the finding rather than a bug.
++
++      in_image  -- A scaled into the image: most candidates live
++      realistic -- A unscaled, as the regression produces it: most filtered away
++    """
++    g = torch.Generator().manual_seed(seed)
++    lx = (torch.rand(n, generator=g) * 6 - 3)
++    ux = lx + torch.rand(n, generator=g) * 2 + 1e-3
++    ly = (torch.rand(n, generator=g) * 2 - 1)
++    ly = torch.where(ly.abs() < 0.05, torch.full_like(ly, 0.05), ly)
++    uy = ly + torch.rand(n, generator=g) * 1 + 1e-3
++    lim = 1.0 / (6.0 * 3.0 ** 0.5)
++    if regime == "in_image":
++        A = (torch.rand(n, generator=g) * 2 - 1) * lim * ly.abs()
++    else:
++        # Planar-regression A coefficients are O(0.1-1); divided by ly they
++        # mostly land outside the sigma'' image, exactly as in production.
++        A = torch.rand(n, generator=g) * 2 - 1
++    B = torch.rand(n, generator=g) * 2 - 1
++    C = torch.rand(n, generator=g) * 2 - 1
++    ABCs = torch.stack((A, B, C), dim=1)
++    to = lambda t: t.to(device)
++    return to(lx), to(ux), to(ly), to(uy), to(ABCs)
++
++
++def live_fraction(args):
++    """Share of A/ly quotients that survive the sigma''-image filter, i.e. how
++    much real root-solving the timed call does."""
++    lx, ux, ly, uy, ABCs = args
++    lim = 1.0 / (6.0 * 3.0 ** 0.5)
++    q = ABCs[:, 0] / ly
++    return (q.abs() <= lim).double().mean().item()
++
++
++def max_abs_diff(a, b):
++    """NaN-aware: NaN in the same position counts as agreement (it is the
++    filtered-out marker), NaN in only one position counts as total disagreement."""
++    worst = 0.0
++    for x, y in zip(a, b):
++        nx, ny = torch.isnan(x), torch.isnan(y)
++        if not torch.equal(nx, ny):
++            return float("inf")
++        m = ~nx
++        if m.any():
++            worst = max(worst, (x[m] - y[m]).abs().max().item())
++    return worst
++
++
++def bench(fn, args, device, warmup=5, reps=30):
++    sync = (lambda: torch.cuda.synchronize()) if device == "cuda" else (lambda: None)
++    for _ in range(warmup):
++        fn(*args)
++    sync()
++    times = []
++    for _ in range(reps):
++        t0 = time.perf_counter()
++        fn(*args)
++        sync()
++        times.append(time.perf_counter() - t0)
++    return statistics.median(times)
++
++
++def run_variant(label, real_cubic, compile_it, args, device, ref=None):
++    pt.USE_REAL_CUBIC = real_cubic
++    fn = pt.check_nonlinear_boundary_tensor
++    compile_s = None
++    if compile_it:
++        fn = torch.compile(pt.check_nonlinear_boundary_tensor)
++        t0 = time.perf_counter()
++        try:
++            out = fn(*args)
++            if device == "cuda":
++                torch.cuda.synchronize()
++        except Exception as e:
++            print(f"  {label:26s} COMPILE FAILED: {type(e).__name__}: "
++                  f"{str(e).splitlines()[0][:120]}")
++            return None, ref
++        compile_s = time.perf_counter() - t0
++    else:
++        out = fn(*args)
++
++    med = bench(fn, args, device)
++    # Numerical check against the production variant: the real cubic is expected
++    # to differ slightly (that is the point); compilation must not change it.
++    dev = ""
++    if ref is not None:
++        d = max_abs_diff(out, ref)
++        dev = ("  NaN-PATTERN DIFFERS" if d == float("inf")
++               else f"  max|diff vs production|={d:.2e}")
++    extra = f"  compile={compile_s:5.1f}s" if compile_s is not None else ""
++    print(f"  {label:26s} median={med * 1e3:8.3f} ms{extra}{dev}")
++    return med, out
++
++
++def main():
++    ap = argparse.ArgumentParser()
++    ap.add_argument("--widths", nargs="+", type=int, default=[100, 1024],
++                    help="neurons per layer; 100 = 3/4/5layer, 1024 = big")
++    ap.add_argument("--regimes", nargs="+", default=["realistic", "in_image"],
++                    choices=["realistic", "in_image"],
++                    help="candidate density; see make_inputs")
++    ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
++    args_cli = ap.parse_args()
++
++    dev = args_cli.device
++    print(f"torch {torch.__version__}  device={dev}"
++          + (f" ({torch.cuda.get_device_name(0)})" if dev == "cuda" else ""))
++    print(f"real-cubic support present: "
++          f"{hasattr(pt, 'inverse_poly_real_tensor')}")
++    if not hasattr(pt, "inverse_poly_real_tensor"):
++        print("\nThe fetched precise_transformer.py predates PASADO_REAL_CUBIC; "
++              "re-download it from the colab-gpu-wip branch.")
++        return
++
++    saved = pt.USE_REAL_CUBIC
++    try:
++        for n in args_cli.widths:
++            for regime in args_cli.regimes:
++                args = make_inputs(n, dev, regime)
++                print(f"\n=== n = {n} neurons, regime={regime} "
++                      f"(live candidates {live_fraction(args) * 100:.1f}%) ===")
++                base, ref = run_variant("eager + complex64", False, False, args, dev)
++                real, _ = run_variant("eager + real cubic", True, False, args, dev, ref)
++                run_variant("compile + complex64", False, True, args, dev, ref)
++                comp, _ = run_variant("compile + real cubic", True, True, args, dev, ref)
++
++                if base and real:
++                    print(f"  -> real cubic alone: {base / real:.3f}x "
++                          f"({'faster' if real < base else 'slower'})")
++                if base and comp:
++                    print(f"  -> compile + real vs production: {base / comp:.3f}x")
++                    print(f"     fusion must beat {real * 1e3:.3f} ms to be worth "
++                          f"having on top of the real solver")
++    finally:
++        pt.USE_REAL_CUBIC = saved
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/forward_mode_tensorized_src/precise_transformer.py b/forward_mode_tensorized_src/precise_transformer.py
+index 7cac8e3..ea4e347 100644
+--- a/forward_mode_tensorized_src/precise_transformer.py
++++ b/forward_mode_tensorized_src/precise_transformer.py
+@@ -1,8 +1,64 @@
++import math
++import os
+ import torch
+ from sklearn import linear_model
+ from SimpleZono import *
+ 
+ 
++# ---------------------------------------------------------------------------
++# Experimental implementation selectors (Phase 3 / Phase 6 of the 5.4 sprint).
++#
++# PASADO_VECTORIZED_PRECISE=1 (default)  -> compute_max_error uses the vectorized
++#     check_corners_tensor / check_nonlinear_boundary_tensor path.
++# PASADO_VECTORIZED_PRECISE=0            -> falls back to the original per-neuron
++#     check_corners / check_nonlinear_boundary Python-loop path.
++#
++# The selector affects ONLY the corner and nonlinear-boundary error checks. The
++# linear regression, the ABCs, the np.random perturbation of A, and every bound
++# computation are byte-for-byte identical on both paths, so a seeded run differs
++# only by floating-point reordering inside the two checks.
++#
++# The module-level flags are read at *call* time, so an in-process harness can
++# flip e.g. `precise_transformer.USE_VECTORIZED_PRECISE = False` between runs.
++# ---------------------------------------------------------------------------
++USE_VECTORIZED_PRECISE = os.environ.get("PASADO_VECTORIZED_PRECISE", "1") != "0"
++
++# PASADO_VEC_BOUNDARY lets the nonlinear-boundary check be toggled independently
++# of the corner check, so the benchmark matrix can express the "corners only"
++# intermediate variant. Default follows PASADO_VECTORIZED_PRECISE. It only has an
++# effect when ABCs_tensor is supplied (i.e. USE_VECTORIZED_PRECISE is on).
++USE_VECTORIZED_BOUNDARY = os.environ.get("PASADO_VEC_BOUNDARY", "1") != "0"
++
++# PASADO_BATCHED_LSTSQ=1 -> sigmoid_prime_product_tensor solves all per-neuron
++#     regressions with a single batched lin_reg_tensor_batched call per layer.
++# PASADO_BATCHED_LSTSQ=0 (default) -> original per-neuron lin_reg_tensor loop.
++# The batched solve is bit-identical to the loop (same design matrices, same
++# gelsd driver, batch iterated at C++ level) and consumes the np.random stream
++# in the same per-neuron order, so seeded runs match exactly. Default stays off
++# so production behavior is unchanged unless the variant is selected explicitly.
++USE_BATCHED_LSTSQ = os.environ.get("PASADO_BATCHED_LSTSQ", "0") != "0"
++
++# PASADO_BATCHED_GRID=1 -> the per-neuron sampling grids are built by
++#     get_linspace_batched in one shot instead of the per-neuron torch.linspace /
++#     cartesian_prod loop. Verified bit-identical (see get_linspace_batched).
++# PASADO_BATCHED_GRID=0 (default) -> original loop. Default off so production
++#     behavior is unchanged unless the variant is selected explicitly.
++USE_BATCHED_GRID = os.environ.get("PASADO_BATCHED_GRID", "0") != "0"
++
++# PASADO_REAL_CUBIC=1 -> inverse_sigmoid_2nd_deriv solves the cubic with Viete's
++#     real trigonometric form instead of Cardano's formula in complex64.
++# PASADO_REAL_CUBIC=0 (default) -> original complex64 path.
++#
++# Unlike the other selectors this one is NOT bit-identical: it deliberately
++# changes numerics, because the complex64 path computes the roots in single
++# precision inside an otherwise float64 analysis (measured residuals 3.8e-06 vs
++# 1.2e-16 -- see inverse_poly_real_tensor). It also removes the only complex
++# arithmetic in the precise path, which is one of the three reasons TorchInductor
++# could not compile it. Default stays off until the end-to-end effect on the
++# reported bounds has been measured.
++USE_REAL_CUBIC = os.environ.get("PASADO_REAL_CUBIC", "0") != "0"
++
++
+ # lx, ly, ux, uy are TENSORS/VECTORS who have as many columns as neurons/variables in a layer
+ def get_linspace(lx, ux, ly, uy, STEPS=5):
+     xs = [torch.linspace(lx[i].item(), ux[i].item(), steps=STEPS) for i in range(lx.shape[0])]
+@@ -11,6 +67,47 @@ def get_linspace(lx, ux, ly, uy, STEPS=5):
+     zs = [torch.cartesian_prod(xs[i], ys[i]) for i in range(len(xs))]
+     return zs
+ 
++
++def _linspace_rows(lo, hi, STEPS):
++    """Row-wise torch.linspace: [n] x [n] -> [n, STEPS], bit-identical.
++
++    torch.linspace does NOT compute start + i*step throughout; it fills the
++    first half forward from `start` and the second half backward from `end`
++    (the same trick numpy uses, so the endpoints are exact and the result is
++    symmetric). Reproducing only the forward half of that formula differs by
++    1 ULP on roughly a quarter of random inputs -- which is what an earlier
++    note in NEXT_RESEARCH_DIRECTIONS.md recorded as "batched linspace is not
++    bit-identical". Mirroring both halves makes it exact, so batching the grid
++    needs no precision concession at all.
++    """
++    t = torch.arange(STEPS, dtype=lo.dtype, device=lo.device)
++    step = (hi - lo) / (STEPS - 1)
++    out = lo.unsqueeze(1) + t * step.unsqueeze(1)
++    tail = torch.arange(STEPS, device=lo.device) >= STEPS // 2
++    out[:, tail] = hi.unsqueeze(1) - (STEPS - 1 - t[tail]) * step.unsqueeze(1)
++    return out
++
++
++def get_linspace_batched(lx, ux, ly, uy, STEPS=5):
++    """[n, STEPS*STEPS, 2], equal to torch.stack(get_linspace(...)) bit for bit.
++
++    Replaces 2n torch.linspace calls, n torch.cartesian_prod calls, 4n .item()
++    calls and the Python loop with a handful of whole-tensor operations. The
++    .item() calls matter beyond their cost: each is a device-host sync, so the
++    loop version cannot run on a GPU without stalling on every neuron
++    (7.87M syncs on the `big` benchmark).
++
++    The cartesian product is assembled by repeat_interleave / repeat, which is
++    pure data movement and therefore exact by construction. Verified bit-exact
++    against the loop for float32 and float64, STEPS in {3,5,7,9}, point boxes
++    (lx==ux, ly==uy), widths down to 1e-12, magnitudes up to 1e6, and negative
++    ranges.
++    """
++    xs = _linspace_rows(lx, ux, STEPS)
++    ys = _linspace_rows(ly, uy, STEPS)
++    return torch.stack((xs.repeat_interleave(STEPS, dim=1),
++                        ys.repeat(1, STEPS)), dim=2)
++
+ # sigmoid(x)*(1-sigmoid(x))*y
+ def sigmoid_prime_times_y(xy_tensor):
+     xs = xy_tensor[:, 0]
+@@ -27,6 +124,10 @@ def softplus_prime_times_y(xy_tensor):
+ # converts a list of tensors like [tensor(3.4), tensor(11.2), tensor(7)]
+ # to a tensor of the form tensor([3.4, 11.2, 7])
+ def lst_as_tensor(lst_of_tensors):
++    # compute_max_error now returns an already-stacked [n] tensor on the fully
++    # vectorized path; pass it through so callers need no branch of their own.
++    if torch.is_tensor(lst_of_tensors):
++        return lst_of_tensors
+     res = torch.stack(lst_of_tensors)
+     return res
+ 
+@@ -77,6 +178,29 @@ def lin_reg_tensor(x, zs):
+     return R
+ 
+ 
++# EXPERIMENTAL batched version of lin_reg_tensor (PASADO_BATCHED_LSTSQ=1).
++# Solves the n independent per-neuron planar regressions in ONE batched
++# least-squares call instead of a Python loop.
++#
++#   x_batch:  [n, m, 2] stacked per-neuron (x, y) grid points
++#   zs_batch: [n, m] or [n, m, 1] stacked per-neuron target values
++#   returns:  [n, 3] coefficients, intercept-first (column 0 = C, 1 = A, 2 = B),
++#             exactly the layout lin_reg_tensor returns per neuron.
++#
++# Matches lin_reg_tensor bit-for-bit: the design matrix is the same [ones | x]
++# concatenation and the same LAPACK gelsd routine solves each matrix in the
++# batch (ATen iterates the batch at C++ level). Preserves dtype and device of
++# x_batch. Validated in experiments/test_batched_lin_reg.py.
++def lin_reg_tensor_batched(x_batch, zs_batch):
++    if zs_batch.dim() == 2:
++        zs_batch = zs_batch.unsqueeze(-1)  # [n, m, 1]
++    ones = torch.ones(x_batch.shape[0], x_batch.shape[1], 1,
++                      dtype=x_batch.dtype, device=x_batch.device)
++    xplusone = torch.cat((ones, x_batch), dim=2)  # [n, m, 3], intercept-first
++    R = torch.linalg.lstsq(xplusone, zs_batch, driver='gelsd').solution  # [n, 3, 1]
++    return R.squeeze(-1)  # [n, 3]
++
++
+ # tensorized/vectorized version (torch is overloaded for the ** operator)
+ def cuberoot(x):
+     return (x ** (0.33333))
+@@ -107,6 +231,55 @@ def inverse_poly_tensor(y):
+     return (x1, x2, x3)
+ 
+ 
++# Smallest tolerance that never discards a root the complex64 path accepts (see
++# the module docstring note on PASADO_REAL_CUBIC). It equals float32 epsilon
++# because the production path decides the same discriminant question in
++# complex64, i.e. at float32 precision.
++_CUBIC_BOUNDARY_TOL = 1e-7
++
++
++def inverse_poly_real_tensor(y, tol=_CUBIC_BOUNDARY_TOL):
++    """The same three roots as inverse_poly_tensor, in real arithmetic.
++
++    inverse_poly_tensor solves the depressed cubic  u^3 - u/4 - y/2 = 0  (which
++    is sigma''(x) = y after substituting s = sigma(x) = u + 1/2) by Cardano's
++    formula evaluated in complex64. For this cubic p = -1/4 and q = -y/2, so
++    4p^3 + 27q^2 < 0 -- all three roots real -- exactly when
++    |y| < 1/(6*sqrt(3)), and that bound IS the maximum of |sigma''|. Over the
++    whole reachable range the complex path therefore computes three real numbers
++    through complex arithmetic. Viete's trigonometric form gives them directly:
++
++        u_k = (1/sqrt(3)) * cos( acos(6*sqrt(3)*y)/3 - 2*pi*k/3 ),  k = 0,1,2
++
++    and the acos argument lies in [-1, 1] precisely when the roots are real, so
++    the range test comes for free.
++
++    Two measured consequences (experiments in lipschitz-comparison/probe_*.py):
++
++    * Accuracy. Residuals |2s^3 - 3s^2 + s - y| for the returned roots:
++      complex64 path median 3.8e-06, this path median 1.2e-16. The old roots are
++      single-precision because complex64 is, inside an analysis that is float64
++      everywhere else -- and inv_sigmoid amplifies a 1e-6 error in s to ~1 in the
++      returned x when s approaches 0 or 1.
++
++    * Root count. Compared as sets (the two formulas order roots differently),
++      the two paths agree on how many roots are real for every in-range,
++      out-of-range and realistic input tested. They disagree only within ~1e-6
++      of the boundary, where the complex path's float32 discriminant is itself
++      unreliable. `tol` handles that: inside the band the argument is clamped,
++      which returns the near-double root rather than discarding it. Keeping a
++      candidate can only enlarge the error term (more conservative); dropping one
++      is what would risk unsoundness. At tol=1e-7 no candidate is ever dropped.
++    """
++    arg = 6.0 * math.sqrt(3.0) * y
++    phi = torch.acos(arg.clamp(-1.0, 1.0)) / 3.0
++    phi = torch.where(arg.abs() <= 1.0 + tol, phi,
++                      torch.full_like(phi, float("nan")))
++    scale = 1.0 / math.sqrt(3.0)
++    two_pi_3 = 2.0 * math.pi / 3.0
++    return tuple(scale * torch.cos(phi - k * two_pi_3) + 0.5 for k in (0, 1, 2))
++
++
+ 
+ # takes in a bool tensor and returns a float tensor where false gets mapped to NaN and true becomes 1.0
+ def bool_to_nan(x):
+@@ -131,6 +304,12 @@ def filter_range(l, u, x):
+ 
+ 
+ def inverse_sigmoid_2nd_deriv(y):
++    if USE_REAL_CUBIC:
++        # Real Viete form: already NaN where no real root exists, so the
++        # bool_to_nan/.real dance the complex path needs does not apply.
++        (x1, x2, x3) = inverse_poly_real_tensor(y)
++        return (inv_sigmoid(x1), inv_sigmoid(x2), inv_sigmoid(x3))
++
+     (x1, x2, x3) = inverse_poly_tensor(y)
+ 
+     b1 = bool_to_nan(x1)  # sets any complex root to just NaN
+@@ -209,6 +388,36 @@ def check_corners(ABCs, lx, ux, ly, uy):
+     return maxs
+ 
+ 
++# EXPERIMENTAL / vectorized version of check_corners.
++# Same semantics as check_corners, but ABCs is passed as a single [n,3] tensor
++# (columns A,B,C) instead of a Python list of (A,B,C) tuples, and all n neurons
++# are evaluated in one batch instead of a Python for-loop.
++#
++# Used by compute_max_error when ABCs_tensor is provided; check_corners is kept
++# as the default (ABCs_tensor=None) path for rollback.
++def check_corners_tensor(ABCs_tensor, lx, ux, ly, uy):
++    A = ABCs_tensor[:, 0]
++    B = ABCs_tensor[:, 1]
++    C = ABCs_tensor[:, 2]
++
++    # all_corners per neuron, in the same order as check_corners:
++    # (lx,ly), (lx,uy), (ux,ly), (ux,uy)  -> shape [n, 4]
++    xs = torch.stack((lx, lx, ux, ux), dim=1)
++    ys = torch.stack((ly, uy, ly, uy), dim=1)
++
++    sig = torch.sigmoid(xs)
++    # same association as sigmoid_prime_times_y: (1-s) * (s*y), for bit-identical results
++    sigmoid_prime_y = (1.0 - sig) * (sig * ys)
++    planar = A.unsqueeze(1) * xs + B.unsqueeze(1) * ys + C.unsqueeze(1)
++
++    evaluation = sigmoid_prime_y - planar  # [n, 4], same as objective_fn per corner
++
++    row_max = torch.max(evaluation, dim=1).values
++    row_min = torch.min(evaluation, dim=1).values
++
++    return torch.max(row_max, -row_min)  # [n]
++
++
+ def check_corners_softplus(ABCs, lx, ux, ly, uy):
+     maxs = []
+     for i in range(lx.size()[0]):
+@@ -294,6 +503,77 @@ def check_nonlinear_boundary(lx, ux, ly, uy, ABCs):
+     return maxs, maxs_uy
+ 
+ 
++def _max_objective_over_x_candidates(A, B, C, xs, ys):
++    # xs: [n, k] candidate x-roots per neuron, ys: [n, 1] the fixed y (ly or uy)
++    # for that neuron, broadcast against xs. Same math as objective_fn, batched,
++    # with NaN candidates (filtered-out roots) mapped to -inf before the max so
++    # they can never win - mirrors the per-neuron loop in check_nonlinear_boundary.
++    sig = torch.sigmoid(xs)
++    # same association as sigmoid_prime_times_y: (1-s) * (s*y), for bit-identical results
++    sigmoid_prime_y = (1.0 - sig) * (sig * ys)
++    planar = A.unsqueeze(1) * xs + B.unsqueeze(1) * ys + C.unsqueeze(1)
++    evaluation = sigmoid_prime_y - planar
++    evaluation = torch.nan_to_num(evaluation, -float("Inf"))
++    return torch.max(evaluation, dim=1).values
++
++
++# EXPERIMENTAL / vectorized version of check_nonlinear_boundary.
++# Same semantics, but ABCs is passed as a single [n,3] tensor (columns A,B,C)
++# instead of a Python list of (A,B,C) tuples, and the two per-neuron
++# objective-max loops are replaced with batched tensor ops.
++#
++# Used by compute_max_error when ABCs_tensor is provided; check_nonlinear_boundary
++# is kept as the default (ABCs_tensor=None) path for rollback.
++def check_nonlinear_boundary_tensor(lx, ux, ly, uy, ABCs_tensor):
++    A = ABCs_tensor[:, 0]
++    B = ABCs_tensor[:, 1]
++    C = ABCs_tensor[:, 2]
++
++    A_by_ly = A / ly
++    A_by_uy = A / uy
++    A_by_ly = inf_to_nan(A_by_ly)  # Checks the case ly=0 (meaning A/ly is undefined)
++    A_by_uy = inf_to_nan(A_by_uy)
++
++    l = -1.0 / (6.0 * np.sqrt(3.0))
++    u = -l
++
++    A_by_ly = filter_range(l, u, A_by_ly)  # checks the case A/ly is NOT in [-.1,.1] (not in image of sigmoid''(x))
++    A_by_uy = filter_range(l, u, A_by_uy)
++
++    root1, root2, root3 = inverse_sigmoid_2nd_deriv(
++        A_by_ly)  # because of the nature of sigmoid''(x), only at most 2 of these will be real
++
++    # checks if the roots (where the extrema is reached) is within [lx,ux], if not the root is replaced with NaN
++    root1 = filter_range(lx, ux, root1)
++    root2 = filter_range(lx, ux, root2)
++    root3 = filter_range(lx, ux, root3)
++
++    # inverse_sigmoid_2nd_deriv computes through complex64, so the roots come
++    # back float32. The original check_nonlinear_boundary stacks each root with
++    # ly/uy, which promotes to the common dtype before objective_fn evaluates
++    # sigmoid; promote explicitly here so the objective is evaluated at the same
++    # precision as the original path (bit-identical results).
++    roots_x = torch.stack((root1, root2, root3), dim=1).to(ly.dtype)  # [n, 3]
++    roots_y = ly.unsqueeze(1)  # [n, 1], broadcasts against roots_x
++
++    maxs = _max_objective_over_x_candidates(A, B, C, roots_x, roots_y)  # [n]
++
++    # NEED TO DO ALL THIS AGAIN FOR A_by_uy
++    root1_uy, root2_uy, root3_uy = inverse_sigmoid_2nd_deriv(A_by_uy)
++
++    root1_uy = filter_range(lx, ux, root1_uy)
++    root2_uy = filter_range(lx, ux, root2_uy)
++    root3_uy = filter_range(lx, ux, root3_uy)
++
++    # same dtype promotion as the roots_x branch above
++    roots_x_uy = torch.stack((root1_uy, root2_uy, root3_uy), dim=1).to(uy.dtype)  # [n, 3]
++    roots_y_uy = uy.unsqueeze(1)  # [n, 1]
++
++    maxs_uy = _max_objective_over_x_candidates(A, B, C, roots_x_uy, roots_y_uy)  # [n]
++
++    return maxs, maxs_uy
++
++
+ def check_nonlinear_boundary_softplus(lx, ux, ly, uy, ABCs):
+     A_by_ly = torch.tensor([ABCs[i][0] / ly[i] for i in range(
+         len(ABCs))])
+@@ -376,14 +656,34 @@ def check_corners_negated(ABCs,lx,ux,ly,uy):
+ """
+ 
+ 
+-def compute_max_error(lx, ux, ly, uy, ABCs):
++def compute_max_error(lx, ux, ly, uy, ABCs, ABCs_tensor=None):
++    """Returns a [n] tensor when both checks are vectorized, else a list of n
++    0-dim tensors (the original shape). The caller normalizes with
++    lst_as_tensor, which now passes an already-stacked tensor through."""
++    fully_vectorized = ABCs_tensor is not None and USE_VECTORIZED_BOUNDARY
++    if fully_vectorized:
++        # Both checks already produce [n] tensors. The previous version unbound
++        # them into Python lists, recombined element-by-element in a loop, and
++        # let lst_as_tensor stack the result straight back into a [n] tensor --
++        # ~20s of pure round-trip on the `big` profile. Elementwise maximum is
++        # exact, so keeping tensors throughout is bit-identical, not merely close.
++        errors = check_corners_tensor(ABCs_tensor, lx, ux, ly, uy)
++        errors2_ly, errors2_uy = check_nonlinear_boundary_tensor(lx, ux, ly, uy, ABCs_tensor)
++        return torch.maximum(torch.maximum(errors, errors2_ly), errors2_uy)
++
+     # checks along the linear function boundaries (by just checking the corners)
+-    errors = check_corners(ABCs, lx, ux, ly, uy)  # This seems to be correct
++    if ABCs_tensor is not None:
++        # Vectorized corners but original boundary check ("corners only"
++        # variant): the boundary path returns lists, so match its shape.
++        errors = list(check_corners_tensor(ABCs_tensor, lx, ux, ly, uy).unbind(0))
++    else:
++        errors = check_corners(ABCs, lx, ux, ly, uy)  # This seems to be correct
+ 
+     # still need to check along the nonlinear boudnary, e.g.
+     # f'(x)*l_y...
+     # f'(x)*u_y...
+     errors2_ly, errors2_uy = check_nonlinear_boundary(lx, ux, ly, uy, ABCs)
++
+     max_errors = []
+     assert (len(errors) == len(errors2_ly) and len(errors) == len(errors2_uy))
+     for i in range(len(errors)):
+@@ -414,23 +714,66 @@ def sigmoid_prime_product_tensor(x, y):
+     ly = y.get_lb()
+     uy = y.get_ub()
+ 
+-    xys = get_linspace(lx, ux, ly, uy)  # this is a list of tensors
+-
+-    zs = [sigmoid_prime_times_y(xy) for xy in xys]
+-
+-    lineqs = [lin_reg_tensor(xys[i], zs[i]) for i in
+-              range(len(zs))]  # list of tensors([A,B,C]) where Ax+By+C is the planar regression
+-
+-    # this has to be 1,2,0 since the linreg function gives the constant offset (c) as the 0th element of the tuple
+-    ABCs = [(lineqs[i][1], lineqs[i][2], lineqs[i][0]) for i in range(len(lineqs))]
+-    ABCs = [(x[0] + np.random.normal(0, .0001), x[1], x[2]) for x in ABCs]
+-    assert (all([(x[0] > 0 or x[0] < 0) for x in ABCs]))
+-    As = torch.tensor([x[0] for x in ABCs])
+-    Bs = torch.tensor([x[1] for x in ABCs])
+-    Cs = torch.tensor([x[2] for x in ABCs])
++    # EXPERIMENTAL batched grid (PASADO_BATCHED_GRID=1): build [n,25,2] directly
++    # instead of a Python list of n [25,2] tensors. Bit-identical either way, so
++    # the two selectors compose freely; whichever consumer needs the other shape
++    # converts once here rather than inside the hot loop.
++    if USE_BATCHED_GRID:
++        xys_batch = get_linspace_batched(lx, ux, ly, uy)
++        xys = None if USE_BATCHED_LSTSQ else list(xys_batch.unbind(0))
++    else:
++        xys = get_linspace(lx, ux, ly, uy)  # this is a list of tensors
++        xys_batch = torch.stack(xys) if USE_BATCHED_LSTSQ else None
++
++    if USE_BATCHED_LSTSQ:
++        # EXPERIMENTAL batched regression path (PASADO_BATCHED_LSTSQ=1): solve
++        # all planar regressions in one batched gelsd call - proven bit-identical
++        # to the per-neuron loop (experiments/test_batched_lin_reg.py). The
++        # np.random stream is consumed one scalar draw per neuron in the same
++        # order as the loop path, so seeded runs match it exactly.
++        x_batch = xys_batch             # [n, 25, 2], exact same grid values
++        xs_grid = x_batch[..., 0]
++        ys_grid = x_batch[..., 1]
++        # same association as sigmoid_prime_times_y: (1-s) * (s*y)
++        zs_batch = (1.0 - torch.sigmoid(xs_grid)) * (torch.sigmoid(xs_grid) * ys_grid)
++        lineqs_b = lin_reg_tensor_batched(x_batch, zs_batch)  # [n, 3] intercept-first
++        perturb = torch.tensor(
++            [np.random.normal(0, .0001) for _ in range(lineqs_b.shape[0])],
++            dtype=lineqs_b.dtype, device=lineqs_b.device)
++        As = lineqs_b[:, 1] + perturb
++        Bs = lineqs_b[:, 2]
++        Cs = lineqs_b[:, 0]
++        assert bool(((As > 0) | (As < 0)).all())
++        # The tuple list is consumed by whichever check still runs the original
++        # per-neuron path. Testing "not USE_VECTORIZED_PRECISE" was not enough:
++        # with vectorized corners but the original boundary check
++        # (PASADO_VEC_BOUNDARY=0) the boundary fallback still needs the list, and
++        # passing None crashed it. That combination was never in the benchmark
++        # matrix, so the latent bug went unnoticed until test_batched_grid.py
++        # enumerated all selector combinations.
++        ABCs = None if (USE_VECTORIZED_PRECISE and USE_VECTORIZED_BOUNDARY) else \
++            [(As[i], Bs[i], Cs[i]) for i in range(As.shape[0])]
++    else:
++        zs = [sigmoid_prime_times_y(xy) for xy in xys]
++
++        lineqs = [lin_reg_tensor(xys[i], zs[i]) for i in
++                  range(len(zs))]  # list of tensors([A,B,C]) where Ax+By+C is the planar regression
++
++        # this has to be 1,2,0 since the linreg function gives the constant offset (c) as the 0th element of the tuple
++        ABCs = [(lineqs[i][1], lineqs[i][2], lineqs[i][0]) for i in range(len(lineqs))]
++        ABCs = [(x[0] + np.random.normal(0, .0001), x[1], x[2]) for x in ABCs]
++        assert (all([(x[0] > 0 or x[0] < 0) for x in ABCs]))
++        As = torch.tensor([x[0] for x in ABCs])
++        Bs = torch.tensor([x[1] for x in ABCs])
++        Cs = torch.tensor([x[2] for x in ABCs])
++
++    # EXPERIMENTAL: tensor form of ABCs for the vectorized corner check. When the
++    # selector is off we pass ABCs_tensor=None so compute_max_error falls back to
++    # the original per-neuron check_corners / check_nonlinear_boundary path.
++    ABCs_tensor = torch.stack((As, Bs, Cs), dim=1) if USE_VECTORIZED_PRECISE else None
+ 
+     # Everything up to this point works (the linear regression and the lower and upper bounds of the input Zonotopes)
+-    errors = compute_max_error(lx, ux, ly, uy, ABCs)
++    errors = compute_max_error(lx, ux, ly, uy, ABCs, ABCs_tensor)
+     errors = lst_as_tensor(errors)
+     errors = traceify(errors)
+ 
