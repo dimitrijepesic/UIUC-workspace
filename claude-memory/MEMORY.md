@@ -4,3 +4,7 @@
 - [gelsd profiling rezultat 22.8](gelsd-profiling-result-2026-08-22.md) — poslato Saši: gelsd 1.7% runa (~4% precise), matmul 45%, hibrid CPU/GPU; čudno: baseline forward_zono sporiji od precise na big
 - [GPU hibrid port plan](gpu-hybrid-port-plan.md) — glavni zadatak od 23.8: 5 koraka (commit → vec_batched_grid osnova → device higijena, 39 factory poziva → lstsq na CPU → Colab korektnost+merenje), 3-4 dana
 - [MLSys rok i scope 23.8](mlsys-deadline-and-scope-2026-08-23.md) — rok 30.10.2026 (68 dana ostalo); catch-up procena 3-4 dana; Faza 1+2 iz PLAN_MLSYS.md realna, Faza 3 stretch; treba pitati Sašu da li Sašino 'fokus na big' suzava scope ispod Faze 3
+- [Mac setup 7.9.2026](mac-setup-2026-09-07.md) — M5 Pro, Accelerate: fp64 matmul 429 GFLOP/s (1,8× stari laptop, A100 36×); MPS nema fp64; arm64 FMA: batched linspace nije bit-egzaktan za STEPS=7/9, produkcija (STEPS=5) nepogođena
+- [Faza učenja 7.9.2026](learning-phase-2026-09-07.md) — korisnik prvo uči kod + diff naspram originala + radove (UCENJE.md, review/), pa hibrid; u ovoj fazi objašnjavati, ne pisati kod umesto njega
+- [PhD cilj 12.9.2026](phd-goal-2026-09-12.md) — MLSys rad + pismo od Saše (traži 15.11) + PhD kod njega; update Saši na svaka 2 dana od 12.9; MacBook pitanje bez odgovora ~2 ned.
+- [GPU cloud opcije 15.9.2026](gpu-cloud-options-2026-09-15.md) — GPU deo hibrida ide u cloud: Modal (30 $/mes besplatno, ~8 h A100) primarno, RunPod ~1,4 $/h, Kaggle P100 besplatno; pitanje o GPU-u grupe nije poslato Saši

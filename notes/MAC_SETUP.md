@@ -30,16 +30,17 @@ cd Pasado
 git remote rename origin backup
 git remote add origin https://github.com/uiuc-arc/Pasado.git
 git remote add fork https://github.com/dimitrijepesic/Pasado
+git branch mac-transfer backup/mac-transfer   # lokalna grana mora prvo da postoji
 git checkout fix-compat-bugs
 git checkout mac-transfer -- .     # prebaci snapshot u radno stablo
 git reset -q                       # i ostavi ga kao necommitovane izmene
-git status --short | wc -l         # očekivano: 66 (isto kao na Windows-u)
+git status --short | wc -l         # očekivano: 67 (66 sa Windows-a + requirements-win-freeze.txt)
 cd ..
 
 # neptune (nema lokalnih commit-ova) + fajlovi koji nisu bili u git-u
 git clone https://github.com/uiuc-arc/neptune.git
 cp extras/neptune/KNOWN_ISSUES.md neptune/
-mkdir -p neptune/.claude && cp extras/neptune/.claude/settings.local.json neptune/.claude/
+# neptune/.claude/settings.local.json nije prebačen sa Windows-a (nema ga u extras) — Claude ga pravi sam
 
 # Local-Lipschitz-Constants (čist klon)
 git clone https://github.com/shizhouxing/Local-Lipschitz-Constants.git
@@ -86,3 +87,14 @@ ls                                            # isti sadržaj kao na Windows-u
 git -C Pasado status --short | head           # M i ?? fajlovi kao na Windows-u
 Pasado/.venv/bin/python -c "import torch, numpy; print(torch.__version__, numpy.__version__)"
 ```
+
+## 6. Urađeno 7.9.2026 (Mac, arm64)
+
+Sve gore je izvršeno; oba venv-a se instaliraju bez skidanja pinova. Provereno:
+svi Pasado testovi prolaze (7 ne-tenzorizovanih + 4 tenzorizovana), smoke test
+`get_lipschitz.py --network 3layer --no-save` prolazi za ~8 s.
+
+Jedina razlika u odnosu na Windows: `test_batched_grid.py` javlja FAIL jer
+`get_linspace_batched` nije bit-egzaktan za STEPS=7/9 (8.9e-16) — `torch.linspace`
+na arm64 koristi FMA, a `_linspace_rows` ne. `torch.addcmul` ga reprodukuje bit-egzaktno.
+Produkcioni put (STEPS=5, `PASADO_BATCHED_GRID=0`) nije pogođen.

@@ -11,3 +11,6 @@ __pycache__/
 *.pyc
 *.egg-info/
 .ipynb_checkpoints/
+
+# Read-only git worktree originalnog Pasada (origin/main), vidi README.md
+/Pasado-original/
