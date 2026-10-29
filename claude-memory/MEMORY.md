@@ -2,5 +2,11 @@
 - [Pasado code-review plan](pasado-code-review-plan.md) — obim (~4.900 linija, 11 commit-ova + necommit-ovano), 3-nivovski metod pregleda, procena 7-10h
 - [Misailo feedback 22.8.2026](misailo-feedback-2026-08-22.md) — 23.8 ZAKLJUČENO: hibrid CPU(gelsd)/GPU port za big je glavni zadatak, korisnik potvrdio ("Dogovoreno! Javljam kad vidim rezultate"); sledeća poruka njemu = rezultati hibrida; male mreže deprioritizovane
 - [gelsd profiling rezultat 22.8](gelsd-profiling-result-2026-08-22.md) — poslato Saši: gelsd 1.7% runa (~4% precise), matmul 45%, hibrid CPU/GPU; čudno: baseline forward_zono sporiji od precise na big
-- [GPU hibrid port plan](gpu-hybrid-port-plan.md) — glavni zadatak od 23.8: 5 koraka (commit → vec_batched_grid osnova → device higijena, 39 factory poziva → lstsq na CPU → Colab korektnost+merenje), 3-4 dana
+- [GPU hibrid port plan](gpu-hybrid-port-plan.md) — 28.10: A2 izabran, u batched putu iza opt-in prekidača; tekuće: kompajliranje celog precise_sigmoid (a57b560, sledeće A100 sveska); handoff notes/HANDOFF_GPU_HYBRID_2026-10-28.md
 - [MLSys rok i scope 23.8](mlsys-deadline-and-scope-2026-08-23.md) — rok 30.10.2026 (68 dana ostalo); catch-up procena 3-4 dana; Faza 1+2 iz PLAN_MLSYS.md realna, Faza 3 stretch; treba pitati Sašu da li Sašino 'fokus na big' suzava scope ispod Faze 3
+- [Mac setup 7.9.2026](mac-setup-2026-09-07.md) — M5 Pro, Accelerate: fp64 matmul 429 GFLOP/s (1,8× stari laptop, A100 36×); MPS nema fp64; arm64 FMA: batched linspace nije bit-egzaktan za STEPS=7/9, produkcija (STEPS=5) nepogođena
+- [Faza učenja 7.9.2026](learning-phase-2026-09-07.md) — bila: objašnjavati, ne pisati kod; od 25.10 za GPU-gelsd Claude piše kod, korisnik pregleda i komituje
+- [PhD cilj 12.9.2026](phd-goal-2026-09-12.md) — MLSys rad + pismo od Saše (traži 15.11) + PhD kod njega; update Saši na svaka 2 dana od 12.9; MacBook pitanje bez odgovora ~2 ned.
+- [GPU cloud opcije 15.9.2026](gpu-cloud-options-2026-09-15.md) — GPU deo hibrida ide u cloud: Modal (30 $/mes besplatno, ~8 h A100) primarno, RunPod ~1,4 $/h, Kaggle P100 besplatno; pitanje o GPU-u grupe nije poslato Saši
+- [Workspace raspored 15.9.2026](workspace-layout-2026-09-15.md) — README.md mapa, CLAUDE.md u korenu (28.10); Pasado na `gpu-hybrid`, `Pasado-original/` worktree PR grane; git identitet samo lokalno
+- [Pasado commit pravila](pasado-commit-rules.md) — samo korisnikovo ime, bez em dash-eva, bez pominjanja AI, commit samo na zahtev preko commit-tree/update-ref, push samo na fork/gpu-hybrid posle skeniranja; komentari u Pasado na engleskom

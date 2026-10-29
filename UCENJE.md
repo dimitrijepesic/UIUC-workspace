@@ -1,7 +1,7 @@
 # Plan učenja — kod, razlike naspram originala, radovi
 
 > Napravljeno 7.9.2026. Cilj: razumeti Pasado kod i svaku izmenu koju sam napravio
-> pre nego što nastavim sa hibridnim CPU/GPU portom.
+> pre nego što nastavim sa hibridnim CPU/GPU portom (`claude-memory/gpu-hybrid-port-plan.md`).
 > Redosled je namerno: prvo teorija (rad), pa netaknuti kod, pa moje izmene, pa skripte.
 > Procena: 4–5 radnih dana. Rok MLSys 30.10.2026, ostalo 53 dana.
 
@@ -135,7 +135,7 @@ CSV-ovi su sirovi rezultati koji stoje iza tabela.
 4. Kvantizacija (`papers/quantization/*.pdf`, Wu et al. 2020; Gholami et al. 2021) — iz
    ranije faze prakse (TVM), **nije** na kritičnom putu, ostavi za kasnije.
 
-### 4.2 Ceo lanac od nule, sam
+### 4.2 Ceo lanac od nule, sam, bez Claude-a
 
 ```bash
 cd ~/prakse/UIUC/Pasado && source .venv/bin/activate
@@ -157,7 +157,7 @@ Ako umeš da objasniš svaku razliku u vremenu i svaki broj — spreman si za po
 
 ## Dan 5 — Nastavak rada: korak 0 hibrida
 
-Iz plana hibridnog porta:
+Iz `claude-memory/gpu-hybrid-port-plan.md`:
 
 0. ✅ 15.9: grana `sprint-optimizations` napravljena, sve commitovano u 3 commita (tri puta
    odlagano). Grana `gpu-hybrid` od nje.

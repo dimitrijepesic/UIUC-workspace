@@ -1,0 +1,14 @@
+{
+	"folders": [
+		{
+			"path": "."
+		},
+		{
+			"path": "../../Downloads/gpu_hybrid_layerwise_results"
+		},
+		{
+			"path": "../../Downloads/gpu_hybrid_split_sweep_results"
+		}
+	],
+	"settings": {}
+}

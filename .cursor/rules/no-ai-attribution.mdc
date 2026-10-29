@@ -1,0 +1,23 @@
+---
+description: Never add AI tool attribution to commits, commit messages, code or docs
+alwaysApply: true
+---
+
+Strict rule from the repository owner. It applies to every task in this workspace
+and to all nested repositories (Pasado, neptune, Local-Lipschitz-Constants).
+
+- Never write or allow any AI attribution in a commit message: no
+  `Co-authored-by` or `Co-Authored-By` trailers naming an AI tool, no
+  "Generated with", no AI tool names or tool email addresses.
+- Do not run `git commit` or `git commit --amend` from the agent environment,
+  because that environment can append such a trailer on its own. Prepare the
+  changes and give the owner the exact commands to run in their own terminal.
+  If a commit is absolutely necessary, write it with plumbing
+  (`git commit-tree` plus `git update-ref`) using a message that contains only
+  what the owner approved, then read the stored message back and confirm it
+  has no attribution line.
+- Code comments, docstrings, docs and logs must not mention AI tools either.
+- Before any push, scan the commits to be pushed for attribution lines and stop
+  if one is found.
+- Commits use the owner's identity: Dimitrije Pešić <dimitrije.pesicc@gmail.com>.
+  Never change the global git identity.

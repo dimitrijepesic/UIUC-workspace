@@ -2,6 +2,10 @@
 
 Mapa foldera, sređeno 15.9.2026.
 
+Aktuelno (19.9.): [dnevni plan](DAILY_PROGRESS_PLAN.md),
+[pregled urađenog i otvorenih pitanja](notes/PROJECT_AUDIT_2026-09-19.md),
+[dnevna evidencija i šablon izveštaja](notes/DAILY_LOG.md).
+
 | folder / fajl | šta je |
 |---|---|
 | `Pasado/` | Pasado. Grana `sprint-optimizations` = ceo moj rad (kod, testovi, `experiments/`, `results/`). Upstream je `origin/main`, snapshot pre sređivanja je grana `mac-transfer`. |
@@ -13,10 +17,13 @@ Mapa foldera, sređeno 15.9.2026.
 | `review/` | kit za čitanje: diffovi mog koda naspram upstream-a, mapa rada, beleške |
 | `UCENJE.md` | plan čitanja koda i radova |
 | `PLAN_MLSYS.md` | plan rada za MLSys |
+| `TASKOVI_HIBRID.md` | taskovi za hibrid CPU/GPU port (T0–T8), sa checkbox-ovima |
 | `notes/` | istorija: statusi, poruke Saši, zaključci, stari TODO, Mac transfer |
+| `CLAUDE.md` | stalni kontekst za Claude: pravila, raspored, trenutno stanje (učitava se i iz `Pasado/`) |
+| `claude-memory/` | kopija Claude memorije projekta (izvor: `~/.claude/projects/-Users-dimitrije-prakse-UIUC/memory/`) |
 | `archive/` | artefakti koji se ne čitaju: stari profili i logovi, TVM kvantizacija, transfer extras |
 
-Venv-ovi (nisu u git-u): `Pasado/.venv` (py3.13), `lipschitz-comparison/.venv` (py3.11). Kako se prave: `MAC_SETUP.md`.
+Venv-ovi (nisu u git-u): `Pasado/.venv` (py3.13), `lipschitz-comparison/.venv` (py3.11). Kako se prave: `notes/MAC_SETUP.md`.
 
 Brzi test da sve radi:
 

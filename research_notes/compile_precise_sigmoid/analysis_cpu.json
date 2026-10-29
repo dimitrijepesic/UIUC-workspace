@@ -1,0 +1,159 @@
+{
+ "commit": "a57b560",
+ "torch": "2.12.1",
+ "device": "cpu",
+ "cases": [
+  {
+   "label": "3layer layer 1: 100 boxes, G0 2",
+   "explain": {
+    "graphs": 1,
+    "breaks": 0,
+    "ops_per_graph": [
+     526
+    ],
+    "break_reasons": []
+   },
+   "compile_s": 1.255923124961555,
+   "fullgraph": "ok",
+   "inductor_kernels": 17,
+   "numpy_state_untouched": true,
+   "nonzero_flag": {
+    "eager": true,
+    "compiled": true
+   },
+   "output_rel_diff": {
+    "rc": 0.0,
+    "rg": 0.0,
+    "dc": 4.53930334462388e-16,
+    "dg": 1.6703959665315754e-16
+   },
+   "output_bitwise": {
+    "rc": true,
+    "rg": true,
+    "dc": false,
+    "dg": false
+   },
+   "output_shapes_equal": true
+  },
+  {
+   "label": "3layer layer 2: 100 boxes, G0 202",
+   "explain": {
+    "graphs": 1,
+    "breaks": 0,
+    "ops_per_graph": [
+     526
+    ],
+    "break_reasons": []
+   },
+   "compile_s": 0.38228466699365526,
+   "fullgraph": "ok",
+   "inductor_kernels": 22,
+   "numpy_state_untouched": true,
+   "nonzero_flag": {
+    "eager": true,
+    "compiled": true
+   },
+   "output_rel_diff": {
+    "rc": 1.6997031113934268e-16,
+    "rg": 2.1143821473362883e-15,
+    "dc": 1.7862899090534033e-15,
+    "dg": 5.583798123593107e-16
+   },
+   "output_bitwise": {
+    "rc": false,
+    "rg": false,
+    "dc": false,
+    "dg": false
+   },
+   "output_shapes_equal": true
+  },
+  {
+   "label": "big layer 1: 1024 boxes, G0 2",
+   "explain": {
+    "graphs": 1,
+    "breaks": 0,
+    "ops_per_graph": [
+     526
+    ],
+    "break_reasons": []
+   },
+   "compile_s": 0.3870052919955924,
+   "fullgraph": "ok",
+   "inductor_kernels": 17,
+   "numpy_state_untouched": true,
+   "nonzero_flag": {
+    "eager": true,
+    "compiled": true
+   },
+   "output_rel_diff": {
+    "rc": 0.0,
+    "rg": 0.0,
+    "dc": 8.59894662223244e-16,
+    "dg": 3.7758119805202923e-16
+   },
+   "output_bitwise": {
+    "rc": true,
+    "rg": true,
+    "dc": false,
+    "dg": false
+   },
+   "output_shapes_equal": true
+  },
+  {
+   "label": "big layer 2: 1024 boxes, G0 2050",
+   "explain": {
+    "graphs": 1,
+    "breaks": 0,
+    "ops_per_graph": [
+     526
+    ],
+    "break_reasons": []
+   },
+   "compile_s": 0.4786922910134308,
+   "fullgraph": "ok",
+   "inductor_kernels": 22,
+   "numpy_state_untouched": true,
+   "nonzero_flag": {
+    "eager": true,
+    "compiled": true
+   },
+   "output_rel_diff": {
+    "rc": 5.925322429029037e-16,
+    "rg": 2.4063839040364722e-15,
+    "dc": 1.3951998921114538e-15,
+    "dg": 1.7257521725240067e-15
+   },
+   "output_bitwise": {
+    "rc": false,
+    "rg": false,
+    "dc": false,
+    "dg": false
+   },
+   "output_shapes_equal": true
+  }
+ ],
+ "3layer_final_bounds": {
+  "S=1": {
+   "max_rel_diff": 0.0,
+   "bitwise": true,
+   "numpy_state_same_as_eager": true
+  },
+  "S=4": {
+   "max_rel_diff": 1.648636925583058e-17,
+   "bitwise": false,
+   "numpy_state_same_as_eager": true
+  }
+ },
+ "big_final_bounds": {
+  "S=1": {
+   "max_rel_diff": 1.852146309341128e-16,
+   "bitwise": false,
+   "numpy_state_same_as_eager": true
+  },
+  "S=4": {
+   "max_rel_diff": 1.4322987371988437e-17,
+   "bitwise": false,
+   "numpy_state_same_as_eager": true
+  }
+ }
+}

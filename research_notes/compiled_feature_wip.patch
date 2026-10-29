@@ -1,0 +1,279 @@
+diff --git a/experiments/test_batched_splits.py b/experiments/test_batched_splits.py
+index 69b2d30..989ca6c 100644
+--- a/experiments/test_batched_splits.py
++++ b/experiments/test_batched_splits.py
+@@ -13,6 +13,7 @@ Run (CPU, float64):
+   python experiments/test_batched_splits.py
+   python experiments/test_batched_splits.py --device cuda
+   python experiments/test_batched_splits.py --closed-form
++  python experiments/test_batched_splits.py --compiled
+ """
+ import argparse
+ import copy
+@@ -159,7 +160,10 @@ def main():
+     ap.add_argument("--quick", action="store_true", help="3layer only, fewer cases")
+     ap.add_argument("--closed-form", action="store_true",
+                     help="batched pass with planar_fit instead of gelsd")
++    ap.add_argument("--compiled", action="store_true",
++                    help="as --closed-form, with planar_fit compiled by TorchInductor")
+     args = ap.parse_args()
++    args.closed_form = args.closed_form or args.compiled
+ 
+     device = torch.device(args.device)
+     dtype = getattr(torch, args.dtype)
+@@ -170,16 +174,32 @@ def main():
+     pt.USE_BATCHED_GRID = True
+     pt.USE_REAL_CUBIC = True
+     bs.USE_CLOSED_FORM_FIT = args.closed_form
+-    print(f"batched plane fit: {'planar_fit (closed form)' if args.closed_form else 'gelsd'}")
+-    # count the closed-form calls, so a switch that does not switch is caught
++    bs.USE_COMPILED_FIT = args.compiled
++    print("batched plane fit:", "planar_fit compiled" if args.compiled
++          else "planar_fit (closed form)" if args.closed_form else "gelsd")
++    # count the calls of the selected closed form, so a switch that does not switch
++    # is caught; the compiled one is counted outside the compiled function
+     closed_form_calls = [0]
+-    fit_planes = planar_fit.fit_planes
++    if args.compiled:
++        make_compiled = planar_fit.compiled_fit_planes
+ 
+-    def counted_fit_planes(grid, z, rcond=None):
+-        closed_form_calls[0] += 1
+-        return fit_planes(grid, z, rcond)
++        def counted_compiled(mode=None):
++            fn = make_compiled(mode)
+ 
+-    planar_fit.fit_planes = counted_fit_planes
++            def run(grid, z, rcond=None):
++                closed_form_calls[0] += 1
++                return fn(grid, z, rcond)
++            return run
++
++        planar_fit.compiled_fit_planes = counted_compiled
++    else:
++        fit_planes = planar_fit.fit_planes
++
++        def counted_fit_planes(grid, z, rcond=None):
++            closed_form_calls[0] += 1
++            return fit_planes(grid, z, rcond)
++
++        planar_fit.fit_planes = counted_fit_planes
+ 
+     if args.quick:
+         test_matches_sequential(device, dtype, ["3layer"], [1, 4], [0, 8], 1)
+diff --git a/experiments/test_planar_fit.py b/experiments/test_planar_fit.py
+index 36acee1..4db0279 100644
+--- a/experiments/test_planar_fit.py
++++ b/experiments/test_planar_fit.py
+@@ -9,11 +9,18 @@
+ 4. With the inputs on another device: result on that device, in the input dtype, and
+    close to the CPU result.
+ 
++With --compiled the same checks run on planar_fit.compiled_fit_planes(), except that
++check 1 becomes: as accurate as fit_planes against the exact solution (worst distance at
++most 10 times fit_planes' plus 1000 ulps) with NaN and inf in the same places, since the
++compiled function is not bit-identical.
++
+ Run:
+   python experiments/test_planar_fit.py
+   python experiments/test_planar_fit.py --device cuda
++  python experiments/test_planar_fit.py --device cuda --compiled
+ """
+ import argparse
++import math
+ import os
+ import sys
+ 
+@@ -30,6 +37,7 @@ import precise_transformer as pt  # noqa: E402
+ import compare_lstsq_solvers as h  # noqa: E402
+ import lstsq_candidates as lc  # noqa: E402
+ import lstsq_contract as ct  # noqa: E402
++import lstsq_oracle as orc  # noqa: E402
+ 
+ SEED = 4242  # not a seed of the comparison
+ BOXES = 500
+@@ -38,6 +46,7 @@ GELSD_RTOL = {"float64": 1e-10, "float32": 1e-3}
+ DEVICE_RTOL = {"float64": 1e-12, "float32": 1e-5}
+ 
+ failures = []
++solve = planar_fit.fit_planes  # or the compiled one, see main
+ 
+ 
+ def check(name, ok, detail=""):
+@@ -64,31 +73,60 @@ def family_bounds(family, dtype_name, k):
+     return h.synthetic_bounds(family, BOXES, SEED + k, dtype_name)
+ 
+ 
+-def test_same_as_candidate(device, dtype_name):
+-    print(f"same bits as candidate A2 ({device}, {dtype_name})")
++def as_accurate_as_eager(grid, z):
++    """(ok, detail) for the compiled function against fit_planes."""
++    got, ref = solve(grid, z).cpu(), planar_fit.fit_planes(grid, z).cpu()
++    fin_got, fin_ref = torch.isfinite(got).all(1), torch.isfinite(ref).all(1)
++    if not torch.equal(fin_got, fin_ref):
++        return False, "non-finite rows differ"
++    s = math.isqrt(grid.shape[1])
++    xs, ys = grid[:, ::s, 0].cpu().tolist(), grid[:, :s, 1].cpu().tolist()
++    zl = z.cpu().tolist()
++    rows = [i for i in range(grid.shape[0]) if fin_ref[i]]
++    if not rows or not torch.isfinite(grid).all():
++        return True, "(non-finite pattern only)"
++    exact = {i: orc.exact_min_norm(xs[i], ys[i], zl[i]) for i in rows}
++    e_got = max(orc.relative_error(got[i].tolist(), exact[i]) for i in rows)
++    e_ref = max(orc.relative_error(ref[i].tolist(), exact[i]) for i in rows)
++    ulp = torch.finfo(grid.dtype).eps
++    return e_got <= 10 * e_ref + 1e3 * ulp, f"(worst error {e_got:.1e} against {e_ref:.1e} eager)"
++
++
++def test_same_as_candidate(device, dtype_name, compiled):
++    print(f"{'as accurate as eager' if compiled else 'same bits as candidate A2'} "
++          f"({device}, {dtype_name})")
+     dtype = getattr(torch, dtype_name)
+     families = h.FAMILIES[:10] + ["offset_narrow", "nonfinite"]
+     for k, family in enumerate(families):
+         b = [t.to(device=device, dtype=dtype) for t in family_bounds(family, dtype_name, k)]
+         grid, z = h.grid_and_targets(*b)
+-        check(family, same_bits(planar_fit.fit_planes(grid, z), lc.solve_A2(grid, z)),
+-              f"({grid.shape[0]} boxes)")
++        if compiled:
++            ok, detail = as_accurate_as_eager(grid, z)
++            check(family, ok, detail)
++        else:
++            check(family, same_bits(planar_fit.fit_planes(grid, z), lc.solve_A2(grid, z)),
++                  f"({grid.shape[0]} boxes)")
+ 
+ 
+-def test_same_on_real_boxes(device, dtype_name):
+-    print(f"same bits on boxes from the batched forward pass of 3layer ({device}, {dtype_name})")
++def test_same_on_real_boxes(device, dtype_name, compiled):
++    print(f"boxes from the batched forward pass of 3layer ({device}, {dtype_name})")
+     cfg = dict(networks=["3layer"], num_images=1, eps_indices=[0, 8, 15], n_splits=4, seed=7,
+                per_network=2000, seed_family=SEED)
+     bounds, _, _ = h.capture_real_boxes(cfg, torch.device("cpu"))
+     dtype = getattr(torch, dtype_name)
+     grid, z = h.grid_and_targets(*(t.to(device=device, dtype=dtype) for t in bounds))
+-    check("real 3layer", same_bits(planar_fit.fit_planes(grid, z), lc.solve_A2(grid, z)),
+-          f"({grid.shape[0]} boxes)")
++    if compiled:
++        ok, detail = as_accurate_as_eager(grid, z)
++        check("real 3layer, as accurate as eager", ok, detail)
++    else:
++        check("real 3layer, same bits as candidate A2",
++              same_bits(planar_fit.fit_planes(grid, z), lc.solve_A2(grid, z)),
++              f"({grid.shape[0]} boxes)")
+ 
+ 
+ def test_contract(device, dtype_name):
+     print(f"contract checks C1-C7 ({device}, {dtype_name})")
+-    rows = ct.contract_checks("planar_fit", planar_fit.fit_planes,
++    rows = ct.contract_checks("planar_fit", solve,
+                               lambda grid, z: lc.chosen_rank("A2", grid, z), True, dtype_name,
+                               device=device)
+     for r in rows:
+@@ -103,7 +141,7 @@ def test_close_to_gelsd(device, dtype_name):
+     for k, family in enumerate(ct.G0_FAMILIES):
+         b = [t.to(device=device, dtype=dtype) for t in ct.g0_bounds(family, BOXES, SEED + 50 + k)]
+         grid, z = h.grid_and_targets(*b)
+-        d = rel_diff(planar_fit.fit_planes(grid, z), pt.lin_reg_tensor_batched(grid, z))
++        d = rel_diff(solve(grid, z), pt.lin_reg_tensor_batched(grid, z))
+         check(family, d <= GELSD_RTOL[dtype_name], f"(max rel diff {d:.2e})")
+ 
+ 
+@@ -113,7 +151,7 @@ def test_device(device, dtype_name):
+     b = [t.to(dtype) for t in ct.g0_bounds("well_conditioned", BOXES, SEED + 99)]
+     grid, z = h.grid_and_targets(*b)
+     ref = planar_fit.fit_planes(grid, z)
+-    got = planar_fit.fit_planes(grid.to(device), z.to(device))
++    got = solve(grid.to(device), z.to(device))
+     check("device and dtype kept", got.device.type == device.type and got.dtype == dtype)
+     d = rel_diff(got.cpu(), ref)
+     check("close to the CPU result", d <= DEVICE_RTOL[dtype_name], f"(max rel diff {d:.2e})")
+@@ -122,16 +160,22 @@ def test_device(device, dtype_name):
+ def main():
+     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+     ap.add_argument("--device", default="cpu")
++    ap.add_argument("--compiled", action="store_true",
++                    help="test planar_fit.compiled_fit_planes() instead of fit_planes")
+     args = ap.parse_args()
+     device = torch.device(args.device)
+     h.set_production_flags()
++    global solve
++    if args.compiled:
++        solve = planar_fit.compiled_fit_planes()
++    print("solver:", "planar_fit.compiled_fit_planes()" if args.compiled else "planar_fit.fit_planes")
+ 
+     for dtype_name in ("float64", "float32"):
+         if device.type == "mps" and dtype_name == "float64":
+             print("SKIP float64 on mps: the device has no float64")
+             continue
+-        test_same_as_candidate(device, dtype_name)
+-        test_same_on_real_boxes(device, dtype_name)
++        test_same_as_candidate(device, dtype_name, args.compiled)
++        test_same_on_real_boxes(device, dtype_name, args.compiled)
+         test_contract(device, dtype_name)
+         test_close_to_gelsd(device, dtype_name)
+         if device.type != "cpu":
+diff --git a/forward_mode_tensorized_src/batched_splits.py b/forward_mode_tensorized_src/batched_splits.py
+index 5836810..8b3150a 100644
+--- a/forward_mode_tensorized_src/batched_splits.py
++++ b/forward_mode_tensorized_src/batched_splits.py
+@@ -28,7 +28,8 @@ Memory grows linearly with S (the sequential loop reuses the same buffers), so
+ The planes are fitted with gelsd on the CPU, as in the sequential code. With
+ USE_CLOSED_FORM_FIT they are fitted on the device by planar_fit.fit_planes
+ instead; the bounds then differ from the sequential code by about 1e-13 relative
+-(results/lstsq_comparison_cuda_2026-10-27/README.md).
++(results/lstsq_comparison_cuda_2026-10-27/README.md). USE_COMPILED_FIT adds
++TorchInductor on top (opt-in, see below).
+ """
+ import os
+ 
+@@ -43,6 +44,11 @@ import precise_transformer as pt
+ # default. Off until validated: gelsd stays the reference.
+ USE_CLOSED_FORM_FIT = os.environ.get("PASADO_CLOSED_FORM_FIT", "0") != "0"
+ 
++# With USE_CLOSED_FORM_FIT, run the closed form compiled by TorchInductor
++# (planar_fit.compiled_fit_planes). Opt-in: the first calls compile for several
++# seconds, which a short run does not win back (results/inductor_dispatch_a3_2026-10-27).
++USE_COMPILED_FIT = os.environ.get("PASADO_COMPILED_FIT", "0") != "0"
++
+ 
+ class BatchedDualZonotope:
+     """S independent dual zonotopes over N variables with G noise symbols each."""
+@@ -138,7 +144,10 @@ def precise_sigmoid(z, seed):
+     grid = pt.get_linspace_batched(lx_f, ux_f, ly_f, uy_f)  # [S*N, 25, 2]
+     gx, gy = grid[..., 0], grid[..., 1]
+     targets = (1.0 - torch.sigmoid(gx)) * (torch.sigmoid(gx) * gy)
+-    fit = planar_fit.fit_planes if USE_CLOSED_FORM_FIT else pt.lin_reg_tensor_batched
++    if USE_CLOSED_FORM_FIT:
++        fit = planar_fit.compiled_fit_planes() if USE_COMPILED_FIT else planar_fit.fit_planes
++    else:
++        fit = pt.lin_reg_tensor_batched
+     coef = fit(grid, targets)  # [S*N, 3], intercept first
+     As = coef[:, 1] + _perturbation(S, N, seed, dtype, device).reshape(-1)
+     Bs = coef[:, 2]
+diff --git a/forward_mode_tensorized_src/planar_fit.py b/forward_mode_tensorized_src/planar_fit.py
+index 53a4978..b803856 100644
+--- a/forward_mode_tensorized_src/planar_fit.py
++++ b/forward_mode_tensorized_src/planar_fit.py
+@@ -206,3 +206,21 @@ def fit_planes(grid, z, rcond=None):
+     rcond = default_rcond(grid.dtype, grid.shape[1]) if rcond is None else rcond
+     cx, cy = gelsd_cutoff_axes(st, rcond)
+     return _fit_targets(st, z, st.xdeg | cx, st.ydeg | cy)
++
++
++_compiled = {}
++
++
++def compiled_fit_planes(mode=None):
++    """fit_planes compiled by TorchInductor, created on first use, one per mode.
++
++    Dynamo captures fit_planes as one graph; on CUDA the 303 kernels of the eager
++    version become about 5 (results/inductor_dispatch_a3_2026-10-27/README.md). The
++    result is not bit-identical to fit_planes, since fusion changes the order of
++    roundings. The first two shapes compile, several seconds each, so this pays off
++    only over many calls. With mode="reduce-overhead" the outputs live in a CUDA
++    graph's memory and are overwritten by the next call: copy them if they are kept.
++    """
++    if mode not in _compiled:
++        _compiled[mode] = torch.compile(fit_planes, fullgraph=True, mode=mode)
++    return _compiled[mode]
