@@ -23,11 +23,13 @@ def code(text):
 
 
 INTRO = r"""
-# Pasado `gpu-hybrid`: ceo `precise_sigmoid` kompajliran TorchInductor-om na A100 (v2)
+# Pasado `gpu-hybrid`: ceo `precise_sigmoid` kompajliran TorchInductor-om na A100 (v3)
 
-**Verzija 2.** Prvi run (v1, harness `df0e88f5…`) zaustavio je gate pre merenja vremena: 868/876 provera, 4 pada G4 i 4 pada G5 (Pasado `results/compiled_sigmoid_cuda_2026-10-28_gate_stop/`, commit `1ac62f9`). v2 menja tačno dve stvari, nijedna tolerancija nije podignuta:
-1. G4: generatorska dimenzija G0 se pre svakog kompajliranog poziva označava kao dinamička (`torch._dynamo.mark_dynamic`), pa jedan graf služi sve slojeve od prvog prolaza; G4 ostaje "isti seed, isti bitovi", G2 dodaje "tačno jedan graf po (mreža, S)".
-2. G5: `dg` se ocenjuje po blokovima (generatori i nule do 1e-12 normwise), a D ugovorom G1 iz `compare_lstsq_solvers.py` (mpmath, manjak relativno na W) na unapred fiksiranom uzorku boksova pri S = 64, eps 8, sa (A, B, C) i boksom koje je izračunao baš kompajlirani graf.
+**Verzija 3.** Oba ranija runa zaustavio je gate pre merenja vremena (arhivirano nepromenjeno u Pasado):
+- v1 (`results/compiled_sigmoid_cuda_2026-10-28_gate_stop/`, `1ac62f9`): 868/876; G4 je zavisio od istorije oblika, G5 je jednom metrikom merio ceo `dg`.
+- v2 (`results/compiled_sigmoid_v2_cuda_2026-10-29_gate_stop/`, `aff244b`): `mark_dynamic` i G5 po blokovima su uspeli, svi gate-ovi boundova i zdravosti prolaze (892/908), ali D ugovor nije izvršen: (A, B, C) su dolazili iz drugog, drugačije fuzionisanog grafa, koji na A100 nikad nije bio bit-identičan merenom.
+
+v3 menja jednu stvar: graf čije se A, B, C i D proveravaju je isti graf čija se korektnost, brzina, memorija i break-even mere. Formalni kandidat je `precise_sigmoid_instrumented` iz harness-a: kopija `batched_splits.precise_sigmoid` sa `a57b560` red po red, koja kao tenzorske izlaze kompajlirane funkcije vraća i `(A, B, C, lx, ux, ly, uy, D)`. Batched prolaz koristi glavne izlaze, a dijagnostiku odbacuje; njena cena ulazi u kandidata. Gate proverava da je kopija verna (eager bit-identična `batched_splits.precise_sigmoid`) i da je D koji kandidat vraća isti D koji propagira. Kompajliran graf bez dijagnostičkih izlaza (kandidat iz v2) ostaje samo ablacija: razlika izlaza, brzina, kerneli, van formalnog ishoda. Sve ostalo kao u v2, nijedna tolerancija nije podignuta.
 
 Pre pokretanja: **Runtime > Change runtime type > GPU (A100)**, zatim **Runtime > Disconnect and delete runtime**, pa **Runtime > Run all**.
 
@@ -37,14 +39,16 @@ Eksperiment, bez izmene koda biblioteke: Pasado na commitu `a57b560`. Režimi se
 2. `batched_G`: batched prolaz, `gelsd` (podrazumevani put);
 3. `batched_A2_eager`: batched, eager `fit_planes`;
 4. `batched_A2_compiled_fit`: batched, kompajliran samo `fit_planes` (`PASADO_COMPILED_FIT`, proizvodni omotač);
-5. `batched_compiled_sigmoid`: `torch.compile(precise_sigmoid, fullgraph=True)` sa eager A2 unutra. Bez ugnježdene kompilacije.
+5. `batched_compiled_sigmoid`: formalni kandidat, `torch.compile(precise_sigmoid_instrumented, fullgraph=True)` sa dijagnostičkim izlazima, eager A2 unutra, G0 označen kao dinamički. Bez ugnježdene kompilacije.
+
+Ablacija (van ishoda): `batched_compiled_sigmoid_uninstrumented`, kompajliran sam `batched_splits.precise_sigmoid`, označen isto.
 
 Mreže 3layer, 4layer, 5layer, big; S = 1, 8, 32, 64; 3 slike; eps indeksi 0 i 8. `big` ide u chunk-ovima od 32 splita na 40 GB, 64 na 80 GB.
 
 Redom:
 1. **Korektnost (gate)**, G1-G8 na celoj mreži konfiguracija, nov kompajlirani callable po (mreža, S). Ako bilo šta padne, sveska preuzima zip i staje.
 2. **Rekompilacije**: po (mreža, S) iz gate-a (grafovi, oblik koji je izazvao kompilaciju, dinamičke dimenzije, limit); zatim jedan deljeni callable preko cele mreže sa podrazumevanim limitom (ne povećava se).
-3. **Vreme**: (a) hladan i topao disk keš u zasebnim procesima za svaku (mreža, S, kompajliran režim), 64 procesa; (b) steady state svih 5 režima u jednom procesu, naizmenično, uz kernele po sloju i peak VRAM.
+3. **Vreme**: (a) hladan i topao disk keš u zasebnim procesima za svaku (mreža, S, kompajliran režim), 64 procesa; (b) steady state svih 5 režima i ablacije u jednom procesu, naizmenično, uz kernele po sloju i peak VRAM.
 4. **Compiler logovi**: `TORCH_LOGS="graph_breaks,recompiles,fusion,output_code"` postavljen pre pokretanja procesa, plus generisani kod iz keša.
 5. **Kriterijumi**, primenjeni mehanički (`summarize`).
 6. Zip.
@@ -56,7 +60,7 @@ Redom:
 - C4: hladan start i break-even se prijavljuju odvojeno (hladan i topao keš) i ne kriju se iza warm rezultata.
 - Ishod: `stop` (C1 pada); `opt-in` (C2 ili C3 pada, ili je topli break-even naspram najboljeg puta bez kompilacije veći od 480 prolaza, jednog standardnog sweep-a od 30 slika × 16 eps, za neku malu mrežu pri S = 1); `auto candidate` (C1-C3 važe i taj topli break-even je najviše 480); `default candidate` (i hladni je najviše 480); `incomplete` (nedostaje konfiguracija).
 
-Očekivano trajanje: oko 45 do 80 minuta (procena; v1 gate je trajao 7 minuta, najviše odlazi na 64 start procesa). Kad završi, pošalji `compiled_sigmoid_v2_cuda.zip`.
+Očekivano trajanje: oko 45 do 80 minuta (procena; v1 gate je trajao 7 minuta, najviše odlazi na 64 start procesa). Kad završi, pošalji `compiled_sigmoid_v3_cuda.zip`.
 """
 
 GPU_CHECK = r"""
@@ -107,7 +111,7 @@ import pandas as pd
 from IPython.display import display
 
 HARNESS = "/content/compiled_sigmoid_harness.py"
-OUT = "/content/compiled_sigmoid_v2_cuda"
+OUT = "/content/compiled_sigmoid_v3_cuda"
 LOGS = f"{OUT}/logs"
 CACHES = "/content/inductor_caches"
 shutil.rmtree(OUT, ignore_errors=True)
@@ -168,12 +172,12 @@ def package(**extra):
                        wall_minutes=round((time.time() - T0) / 60, 1), **info, **extra)
     with open(f"{OUT}/colab_environment.json", "w") as f:
         json.dump(environment, f, indent=2)
-    archive = "/content/compiled_sigmoid_v2_cuda.zip"
+    archive = "/content/compiled_sigmoid_v3_cuda.zip"
     with ZipFile(archive, "w", ZIP_DEFLATED) as zf:
         for root, _, names in os.walk(OUT):
             for n in sorted(names):
                 path = os.path.join(root, n)
-                zf.write(path, os.path.join("compiled_sigmoid_v2_cuda", os.path.relpath(path, OUT)))
+                zf.write(path, os.path.join("compiled_sigmoid_v3_cuda", os.path.relpath(path, OUT)))
     print(json.dumps(environment, indent=2))
     print(archive, round(os.path.getsize(archive) / 2**20, 2), "MiB")
     files.download(archive)
@@ -184,7 +188,7 @@ GATE_MD = r"""
 
 Jedan proces, prazan keš `GATE_CACHE` (posle ga deljeni callable i steady state koriste kao topao keš). `TORCH_LOGS="recompiles,graph_breaks,dynamic"` je postavljen pre pokretanja procesa, za odeljak 2.
 
-Na svakoj (mreža, S, slika, eps): G1 `fullgraph=True` prolazi; G2 nema fallback-a (svaki poziv kroz kompajlirani callable, jedan "Torch-Compiled Region" po pozivu u profileru, bez `lstsq`, `compile_fallback` prazan, unutra eager `fit_planes`) i tačno jedan graf služi sve slojeve; G3 NumPy stanje kao eager A2; G4 isti seed, isti bitovi; G5 `rc`, `rg`, `dc` i blokovi `dg` (generatori, nule) kao eager do 1e-12 normwise, isti oblici i nonzero flag; pri S = 64, eps 8 još i D: dijagnostički graf bit-identičan proizvodnom, pa manjak kompajliranog D ispod mpmath maksimuma relativno na W najviše 10 × max(1e-12, manjak eager-a), po mreži, na fiksiranom uzorku (do 128 boksova po mreži, slici i sloju); G6 per-split naspram eager A2 do 1e-10; G7 finalni bound naspram sekvencijalnog G do 1e-10; G8 autograd (bound nije ispod uzorkovanog maksimuma; i bez seed-a na 3layer).
+Na svakoj (mreža, S, slika, eps): G1 `fullgraph=True` prolazi; G2 nema fallback-a (svaki poziv kroz kompajliranog kandidata, jedan "Torch-Compiled Region" po pozivu u profileru, bez `lstsq`, `compile_fallback` prazan, unutra eager `fit_planes`) i tačno jedan graf služi sve slojeve; G3 NumPy stanje kao eager A2; G4 isti seed, isti bitovi; G5 `rc`, `rg`, `dc` i blokovi `dg` (generatori, nule) kao eager do 1e-12 normwise, isti oblici i nonzero flag, kopija kandidata pokrenuta eager bit-identična `batched_splits.precise_sigmoid`, D koji kandidat vraća bit-identičan D-u koji propagira; pri S = 64, eps 8 još i D ugovor: manjak D ispod mpmath maksimuma za A, B, C i boks iz izlaza samog kandidata, relativno na W, najviše 10 × max(1e-12, manjak eager-a), po mreži, na fiksiranom uzorku (do 128 boksova po mreži, slici i sloju); G6 per-split naspram eager A2 do 1e-10; G7 finalni bound naspram sekvencijalnog G do 1e-10; G8 autograd (bound nije ispod uzorkovanog maksimuma; i bez seed-a na 3layer).
 
 Ako bilo šta padne: zip se preuzima i sveska staje.
 """
@@ -199,13 +203,13 @@ if rc_gate != 0 or not os.path.exists(checks_path):
     if os.path.exists(checks_path):
         display(checks[~checks.ok].head(50))
     package(stopped_at="gate", gate_rc=rc_gate)
-    raise RuntimeError("Gate nije prošao, sveska staje. Pošalji compiled_sigmoid_v2_cuda.zip.")
+    raise RuntimeError("Gate nije prošao, sveska staje. Pošalji compiled_sigmoid_v3_cuda.zip.")
 """
 
 RECOMPILE_MD = r"""
 ## 2. Rekompilacije
 
-Prvo iz gate-a: za svaku (mreža, S), sa novim callable-om posle `torch._dynamo.reset()`, broj grafova (u v2 očekivano 1), oblici `(S_chunk, G0, N)` koji su izazvali kompilaciju, dimenzije koje su postale dinamičke (`create_symbol` iz `TORCH_LOGS=dynamic`), razlozi rekompilacije i da li je dostignut limit.
+Prvo iz gate-a: za svaku (mreža, S), sa novim callable-om posle `torch._dynamo.reset()`, broj grafova (očekivano 1), oblici `(S_chunk, G0, N)` koji su izazvali kompilaciju, dimenzije koje su postale dinamičke (`create_symbol` iz `TORCH_LOGS=dynamic`), razlozi rekompilacije i da li je dostignut limit.
 
 Zatim jedan **deljeni** callable preko cele mreže (3layer → big, S = 1 → 64, dva kruga), sa podrazumevanim Dynamo limitom koji se ne menja, za ceo sigmoid i za compiled fit. Ako se limit dostigne, `fullgraph=True` baca grešku: to se beleži i eksperiment za taj režim staje (proizvodni compiled fit umesto toga prelazi na eager, što se vidi u koloni `new_fallback`).
 """
@@ -247,7 +251,7 @@ print("failures:", start_failures or "none")
 STEADY_MD = r"""
 ## 3b. Steady state
 
-Jedan proces, topao keš iz gate-a. Po (mreža, S) nov kompajlirani state; svih 5 režima naizmenično, redosled se rotira svako ponavljanje; 5 ponavljanja po (slika, eps) = 30 uzoraka po (mreža, S, režim), pod `torch.compiler.set_stance("fail_on_recompile")`. Zatim peak VRAM jednog prolaza, kerneli po prolazu i po sigmoid sloju (profiler), i provere putanje (kompajlirani regioni po prolazu, `lstsq` samo u G režimima, finalni bound naspram sekvencijalnog).
+Jedan proces, topao keš iz gate-a. Po (mreža, S) nov kompajlirani state; svih 5 režima i ablacija naizmenično, redosled se rotira svako ponavljanje; 5 ponavljanja po (slika, eps) = 30 uzoraka po (mreža, S, režim), pod `torch.compiler.set_stance("fail_on_recompile")`. Zatim peak VRAM jednog prolaza, kerneli po prolazu i po sigmoid sloju (profiler), i provere putanje (kompajlirani regioni po prolazu, `lstsq` samo u G režimima, finalni bound naspram sekvencijalnog); provere ablacije se beleže sa `formal=False` i ne ulaze u C1.
 """
 
 STEADY = r"""
@@ -320,6 +324,11 @@ show("steady_kernels.csv", lambda df: df[df.layer.astype(str) != "pass"].pivot_t
 print("CUDA kernels per pass")
 show("steady_kernels.csv", lambda df: df[df.layer.astype(str) == "pass"].pivot_table(
     index=["network", "S"], columns="mode", values="kernels"))
+print("ablation (not in the outcome): median(candidate) / median(uninstrumented)")
+try:
+    display(pd.DataFrame(criteria["ablation_uninstrumented"]["cells"]).pivot_table(index="network", columns="S", values="ratio").round(3))
+except Exception as e:
+    print("ablation:", type(e).__name__, e)
 print("peak VRAM of one pass, MiB")
 show("steady_memory.csv", lambda df: df.pivot_table(index=["network", "S"], columns="mode", values="peak_mb").round(0))
 """

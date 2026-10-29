@@ -3,25 +3,32 @@ warm compilation, steady state.
 
 Harness of the notebook COLAB_COMPILED_PRECISE_SIGMOID.ipynb. Pasado is used as it is at
 a57b560: nothing in the library changes, the modes below are selected from outside
-(module flags, and batched_splits.precise_sigmoid swapped for the compiled function).
+(module flags, and batched_splits.precise_sigmoid swapped for a compiled function).
 
-PRE-REGISTERED PROTOCOL, VERSION 2 (written 2026-10-28, before any measurement of v2;
+PRE-REGISTERED PROTOCOL, VERSION 3 (written 2026-10-29, before any measurement of v3;
 the notebook stores the sha256 of this file with the results)
 
-Version 1 (workspace commit 91e02e4) ran once on an A100-80GB and its gate stopped it
-before any timing: 868 of 876 checks passed, G4 failed 4 times and G5 4 times (Pasado
-results/compiled_sigmoid_cuda_2026-10-28_gate_stop, commit 1ac62f9). Version 2 changes
-exactly two things and nothing else; no tolerance is raised:
-  1. G4 had failed because the graph serving the first sigmoid layer depended on the
-     shapes the callable had seen: in the first pass a graph with static G0, later the
-     graph with G0 dynamic compiled for the second layer. Now the generator dimension
-     (dimension 1 of z.rg and z.dg) is marked dynamic before every compiled call, so one
-     graph serves every layer of a (network, S) from the first pass. G4 is unchanged;
-     G2 adds that exactly one graph serves every layer.
-  2. G5 had judged the whole of dg by one normwise difference, which the error term D
-     dominates on narrow boxes, where D is computed with cancellation and every entry of
-     dg is small. dg is now judged by blocks; D by the G1 contract of
-     experiments/compare_lstsq_solvers.py on a sample of boxes fixed below.
+History. Each earlier version ran once on an A100-80GB and its gate stopped it before
+any timing; both runs are archived unchanged in Pasado.
+  v1 (workspace 788589d, first committed as 91e02e4): 868 of 876 checks; G4 failed 4
+     times (the graph serving the first layer depended on the shapes seen before) and G5
+     4 times (one normwise metric over the whole dg, dominated by D on narrow boxes).
+     results/compiled_sigmoid_cuda_2026-10-28_gate_stop, Pasado 1ac62f9.
+  v2 (workspace 7c9a8ef, first committed as e18278c): mark_dynamic and G5 by blocks;
+     892 of 908 checks, every bound and soundness gate passed, but the D contract could
+     not run: its (A, B, C) came from a second, differently fused compiled graph, which
+     on the A100 was never bit-identical to the measured one.
+     results/compiled_sigmoid_v2_cuda_2026-10-29_gate_stop, Pasado aff244b.
+Version 3 changes one thing: the graph whose A, B, C and D are checked is the graph whose
+correctness, speed, memory and break-even are measured. The formal candidate is
+precise_sigmoid_instrumented below, a line-for-line copy of batched_splits.precise_sigmoid
+at a57b560 that also returns (A, B, C, lx, ux, ly, uy, D) as tensor outputs of the
+compiled function itself (return_diagnostics=True). The batched pass uses its main outputs
+and drops the diagnostics; their cost is part of the candidate. A gate check proves the
+copy faithful: run eagerly, it is bit-identical to batched_splits.precise_sigmoid. The
+uninstrumented compiled graph (v2's candidate) is an ablation only: output difference,
+speed and kernels are reported, outside the formal outcome. Everything else as in v2;
+no tolerance is raised.
 
 Modes, all float64, seed 7, every batched mode through batched_splits.split_bounds:
   sequential_G              the original loop over splits, gelsd on the CPU
@@ -29,10 +36,14 @@ Modes, all float64, seed 7, every batched mode through batched_splits.split_boun
   batched_A2_eager          batched pass, planar_fit.fit_planes eager (PASADO_CLOSED_FORM_FIT)
   batched_A2_compiled_fit   as above with fit_planes compiled (PASADO_COMPILED_FIT, through
                             the production wrapper planar_fit.compiled_fit_planes)
-  batched_compiled_sigmoid  torch.compile(batched_splits.precise_sigmoid, fullgraph=True)
-                            with the eager fit_planes inside, and the generator dimension
+  batched_compiled_sigmoid  the formal candidate: torch.compile(precise_sigmoid_instrumented,
+                            fullgraph=True), return_diagnostics=True, with the eager fit_planes
+                            inside and the generator dimension (dimension 1 of z.rg and z.dg)
                             marked dynamic before every call (torch._dynamo.mark_dynamic).
                             Never nested: fit_planes is not compiled separately in this mode.
+  batched_compiled_sigmoid_uninstrumented
+                            ablation, not in the outcome: torch.compile of
+                            batched_splits.precise_sigmoid itself, marked the same way.
 Grid: networks 3layer, 4layer, 5layer, big; S = n_splits in 1, 8, 32, 64; 3 images; eps
 indices 0 and 8. big runs in chunks of --big-chunk splits (from the VRAM, as in
 COLAB_V3_COMPILED: 32 on 40 GB, 64 on 80 GB).
@@ -40,37 +51,34 @@ COLAB_V3_COMPILED: 32 on 40 GB, 64 on 80 GB).
 Correctness gate, checked on the whole grid with a new compiled callable per (network, S);
 all must hold, otherwise the notebook stops before any timing:
   G1 fullgraph=True compiles every shape met (no exception).
-  G2 no fallback: every sigmoid layer call goes through the compiled callable, a profiled
-     pass shows one "Torch-Compiled Region" per call and no lstsq, at least one graph is
-     compiled per (network, S), planar_fit.compile_fallback stays empty, and the plane
-     fit selected inside is the eager fit_planes (no nested compile). Since v2: exactly
-     one graph is compiled per (network, S), and every compiled region of the profiled
-     pass carries the same compile id.
+  G2 no fallback: every sigmoid layer call goes through the compiled candidate, a
+     profiled pass shows one "Torch-Compiled Region" per call and no lstsq, planar_fit.
+     compile_fallback stays empty, and the plane fit selected inside is the eager
+     fit_planes (no nested compile). Exactly one graph is compiled per (network, S), and
+     every compiled region of the profiled pass carries the same compile id.
   G3 the NumPy generator state after a pass is identical to the eager A2 pass.
   G4 two compiled passes with the same seed give the same bits.
-  G5 every compiled precise_sigmoid call against eager on the same input, normwise
-     (max |diff| / max |eager|, or max |diff| where eager is all zero), at most 1e-12 for
-     rc, rg, dc, and for the first two blocks of dg: the propagated generators
-     A rg + B dg (rows :G0) and the zeros (rows G0:, the diagonal D of the last N rows
-     excluded); the same shapes and the same nonzero flag. The normwise difference of D is
-     recorded, not judged. D is judged at S = 64, eps index 8 (where v1 failed), as in G1
-     of compare_lstsq_solvers.py:
-       identity  a diagnostic graph (the same precise_sigmoid compiled as a separate
-                 function, marked the same way, with pt.check_corners_tensor wrapped to
-                 record the (A, B, C) and the box it receives, i.e. the very values the
-                 graph computed) gives four main outputs and a flag bit-identical to the
-                 production compiled graph, at every call. Only then are its (A, B, C) and
-                 box used; D itself is read from the production output (diagonal of the
-                 last N rows of dg, an exact copy).
+  G5 every call of the compiled candidate against eager batched_splits.precise_sigmoid on
+     the same input, normwise (max |diff| / max |eager|, or max |diff| where eager is all
+     zero), at most 1e-12 for rc, rg, dc, and for the first two blocks of dg: the
+     propagated generators A rg + B dg (rows :G0) and the zeros (rows G0:, the diagonal D
+     of the last N rows excluded); the same shapes and the same nonzero flag. Also, at
+     every call:
+       copy      the candidate run eagerly gives the four main outputs and the flag of
+                 batched_splits.precise_sigmoid bit for bit;
+       D output  the D the compiled candidate returns equals, bit for bit, the D it
+                 propagates (the diagonal of the last N rows of its dg).
+     The normwise difference of D against eager is recorded, not judged. D is judged at
+     S = 64, eps index 8, as in G1 of compare_lstsq_solvers.py:
        contract  per box, shortfall = max(0, D_true - D) / W with D_true the maximum of
                  |sigmoid'(x) y - (A x + B y + C)| over the box (lstsq_oracle.true_max_error,
-                 mpmath, 50 digits) and W = |A| r_x + |B| r_y + D, for the compiled values
-                 (compiled A, B, C, box, D) and for the eager values (eager A, B, C, box, D,
-                 from an eager call recorded the same way). Pass, per network over its
-                 sample: worst compiled shortfall <= 10 * max(1e-12, worst eager shortfall).
-                 Boxes whose D_true cannot be computed (no convergence) are listed, not
-                 counted. Also recorded: the absolute shortfall and the shortfall relative
-                 to D.
+                 mpmath, 50 digits) and W = |A| r_x + |B| r_y + D. Compiled: A, B, C and
+                 the box from the diagnostic outputs of the compiled candidate, D from its
+                 dg. Eager: the same from the candidate run eagerly. Pass, per network over
+                 its sample: worst compiled shortfall <= 10 * max(1e-12, worst eager
+                 shortfall). Boxes whose D_true cannot be computed (no convergence) are
+                 listed, not counted. Also recorded: the absolute shortfall and the
+                 shortfall relative to D.
        sample    fixed before the run: networks 3layer, 4layer, 5layer, big; every sigmoid
                  layer; the 3 images; S = 64, eps index 8; the boxes of all chunks of the
                  pass. Per (network, image, layer): the 32 boxes with the largest
@@ -78,6 +86,8 @@ all must hold, otherwise the notebook stops before any timing:
                  |D_compiled - D_eager| / W_compiled, then 64 others uniformly at random
                  from numpy.random.default_rng([20261028, network index, image id, layer]);
                  ties by box index. At most 128 boxes, 4992 in all.
+     Recorded, not judged: the ablation's main outputs against the candidate's (normwise,
+     and whether bit-identical).
   G6 every per-split bound within 1e-10 relative of eager A2.
   G7 the final bound (max over splits) within 1e-10 relative of sequential G.
   G8 the final bound is not below the sampled maximum of the true derivative (autograd,
@@ -97,10 +107,12 @@ Timing:
           callable, runs the first sweep over the 6 (image, eps) passes (e2e_s, includes
           compiling), then REPEATS more passes of each (its own steady state).
   steady  one process with a warm cache; per (network, S) a new compiled state; the five
-          modes interleaved round-robin with the order rotated every repeat, REPEATS = 5
-          passes per (image, eps) per mode, so 30 samples per (network, S, mode), under
-          torch.compiler.set_stance("fail_on_recompile"). Reported: median, min, max;
-          kernels per sigmoid layer and per pass (profiler); peak VRAM of one pass.
+          modes and the ablation interleaved round-robin with the order rotated every
+          repeat, REPEATS = 5 passes per (image, eps) per mode, so 30 samples per
+          (network, S, mode), under torch.compiler.set_stance("fail_on_recompile").
+          Reported: median, min, max; kernels per sigmoid layer and per pass (profiler);
+          peak VRAM of one pass. The checks of the ablation are recorded with
+          formal=False and do not enter C1.
 
 Definitions:
   overhead_s  e2e_s of a start process minus the sum of its 6 per-(image, eps) steady
@@ -112,7 +124,7 @@ Definitions:
 
 Criteria:
   C1 correctness: the gate (G1 to G8) passes, and so does every check of the steady
-     process (the final bound of every mode within 1e-10 of sequential G, one compiled
+     process (formal modes only: the final bound within 1e-10 of sequential G, one compiled
      region per sigmoid call in the compiled modes and none in the others, lstsq only in
      the gelsd modes, no compiled-fit fallback, every configuration ran) and of every
      start process (no compiled-fit fallback, at least one graph compiled, every bound
@@ -199,10 +211,12 @@ D_CONTRACT_FLOOR = 1e-12
 SEQUENTIAL = "sequential_G"
 COMPILED_FIT = "batched_A2_compiled_fit"
 COMPILED_SIGMOID = "batched_compiled_sigmoid"
-MODES = [SEQUENTIAL, "batched_G", "batched_A2_eager", COMPILED_FIT, COMPILED_SIGMOID]
-BATCHED_MODES = MODES[1:]
+ABLATION = "batched_compiled_sigmoid_uninstrumented"
+MODES = [SEQUENTIAL, "batched_G", "batched_A2_eager", COMPILED_FIT, COMPILED_SIGMOID]  # formal
+STEADY_MODES = MODES + [ABLATION]
+BATCHED_MODES = STEADY_MODES[1:]
 COMPILED_MODES = [COMPILED_FIT, COMPILED_SIGMOID]
-CLOSED_FORM_MODES = MODES[2:]
+CLOSED_FORM_MODES = STEADY_MODES[2:]
 
 EAGER_SIGMOID = bs.precise_sigmoid
 OUTPUTS = ("rc", "rg", "dc", "dg")
@@ -344,42 +358,79 @@ def marked(fn):
     return run
 
 
-def make_trackers():
-    """A tracker per batched mode; the compiled sigmoid is a new torch.compile object
-    (compiles on its first call)."""
-    return {m: Tracker(marked(torch.compile(EAGER_SIGMOID, fullgraph=True)) if m == COMPILED_SIGMOID
-                       else EAGER_SIGMOID, m) for m in BATCHED_MODES}
+def precise_sigmoid_instrumented(z, noise, return_diagnostics=True):
+    """The v3 candidate: batched_splits.precise_sigmoid of a57b560, line for line, that can
+    also return the values of its error term as tensor outputs, each [S*N]:
+    (A, B, C, lx, ux, ly, uy, D). The gate checks that, run eagerly, it gives the main
+    outputs of batched_splits.precise_sigmoid bit for bit."""
+    S, G0, N = z.rg.shape
+
+    lx, ux = bs._bounds(z.rc, z.rg)
+    ly, uy = bs._bounds(z.dc, z.dg)
+
+    # SigmoidZonotope on the real part
+    s_lb, s_ub = torch.sigmoid(lx), torch.sigmoid(ux)
+    lam = torch.min(s_lb * (1 - s_lb), s_ub * (1 - s_ub))
+    mu1 = 0.5 * (s_ub + s_lb - lam * (ux + lx))
+    mu2 = 0.5 * (s_ub - s_lb - lam * (ux - lx))
+    sig_c = lam * z.rc + mu1
+
+    # Planar regression of sigmoid'(x) * y on the 5 x 5 grid of every (split, neuron)
+    # box. The boxes are independent, so [S, N] flattens to one batch of S*N.
+    lx_f, ux_f, ly_f, uy_f = (t.reshape(-1) for t in (lx, ux, ly, uy))
+    grid = pt.get_linspace_batched(lx_f, ux_f, ly_f, uy_f)  # [S*N, 25, 2]
+    gx, gy = grid[..., 0], grid[..., 1]
+    targets = (1.0 - torch.sigmoid(gx)) * (torch.sigmoid(gx) * gy)
+    coef = bs.plane_fit_for(grid)(grid, targets)  # [S*N, 3], intercept first
+    As = coef[:, 1] + noise.reshape(-1)
+    Bs = coef[:, 2]
+    Cs = coef[:, 0]
+    a_nonzero = ((As > 0) | (As < 0)).all()
+
+    # worst-case approximation error, same three checks as compute_max_error
+    abc = torch.stack((As, Bs, Cs), dim=1)
+    corners = pt.check_corners_tensor(abc, lx_f, ux_f, ly_f, uy_f)
+    err_ly, err_uy = pt.check_nonlinear_boundary_tensor(lx_f, ux_f, ly_f, uy_f, abc)
+    errors = torch.maximum(torch.maximum(corners, err_ly), err_uy).reshape(S, N)
+    diagnostics = (As, Bs, Cs, lx_f, ux_f, ly_f, uy_f, errors.reshape(-1))
+
+    As, Bs, Cs = As.reshape(S, N), Bs.reshape(S, N), Cs.reshape(S, N)
+    dual_c = As * z.rc + Bs * z.dc + Cs
+
+    # Generator layout per split, G0 + 2N rows:
+    #   real: [lam * rg | diag(mu2) | 0]      dual: [A * rg + B * dg | 0 | diag(errors)]
+    new_rg = z.rg.new_zeros((S, G0 + 2 * N, N))
+    new_rg[:, :G0, :] = lam.unsqueeze(1) * z.rg
+    new_rg[:, G0:G0 + N, :].diagonal(dim1=1, dim2=2).copy_(mu2)
+
+    new_dg = z.rg.new_zeros((S, G0 + 2 * N, N))
+    new_dg[:, :G0, :] = As.unsqueeze(1) * z.rg + Bs.unsqueeze(1) * z.dg
+    new_dg[:, G0 + N:, :].diagonal(dim1=1, dim2=2).copy_(errors)
+
+    out = bs.BatchedDualZonotope(sig_c, new_rg, dual_c, new_dg)
+    if return_diagnostics:
+        return out, a_nonzero, diagnostics
+    return out, a_nonzero
 
 
-CHECK_CORNERS = pt.check_corners_tensor
-_recorded = []
-
-
-def _recording_check_corners(abc, lx, ux, ly, uy):
-    _recorded.append((abc, lx, ux, ly, uy))
-    return CHECK_CORNERS(abc, lx, ux, ly, uy)
-
-
-def diagnostic_sigmoid(z, noise):
-    """precise_sigmoid under a name of its own: Dynamo caches graphs per code object, so the
-    diagnostic graphs stay apart from the production ones."""
-    return EAGER_SIGMOID(z, noise)
-
-
-def recording(fn):
-    """fn with pt.check_corners_tensor wrapped while it runs. Returns (fn's result, (abc, lx,
-    ux, ly, uy)): the (A, B, C) and the box precise_sigmoid passed on to the corner check,
-    which compiled are the very values the graph computed."""
+def drop_diagnostics(fn):
+    """fn for the batched pass: its main outputs; the diagnostics are computed and dropped."""
     def run(z, noise):
-        _recorded.clear()
-        pt.check_corners_tensor = _recording_check_corners
-        try:
-            out = fn(z, noise)
-        finally:
-            pt.check_corners_tensor = CHECK_CORNERS
-        assert len(_recorded) == 1, len(_recorded)
-        return out, _recorded[0]
+        out, a_nonzero, _ = fn(z, noise)
+        return out, a_nonzero
     return run
+
+
+def make_trackers():
+    """A tracker per batched mode, the compiled ones new torch.compile objects (they compile
+    on their first call). The candidate's tracker keeps the compiled function with its
+    diagnostics as .with_diagnostics."""
+    trackers = {m: Tracker(EAGER_SIGMOID, m) for m in BATCHED_MODES}
+    candidate = marked(torch.compile(precise_sigmoid_instrumented, fullgraph=True))
+    trackers[COMPILED_SIGMOID] = Tracker(drop_diagnostics(candidate), COMPILED_SIGMOID)
+    trackers[COMPILED_SIGMOID].with_diagnostics = candidate
+    trackers[ABLATION] = Tracker(marked(torch.compile(EAGER_SIGMOID, fullgraph=True)), ABLATION)
+    return trackers
 
 
 def fresh_compiled_state():
@@ -493,28 +544,29 @@ def _d_of(dg, G0, N):
     return dg[:, G0 + N:, :].diagonal(dim1=1, dim2=2)
 
 
-def compare_layers(net, img, eps, S, comp, diag=None):
-    """Every precise_sigmoid call of an eager A2 pass, compiled and eager on the same input.
-
-    With diag (the recording diagnostic graph) the eager call is recorded too, the
-    diagnostic outputs are compared bit for bit with the production compiled ones, and the
-    per-box values the D contract needs are kept (on the CPU, all chunks)."""
+def compare_layers(net, img, eps, S, candidate, ablation, keep_boxes=False):
+    """Every precise_sigmoid call of an eager A2 pass: the compiled candidate (with its
+    diagnostics) against eager batched_splits.precise_sigmoid on the same input, the
+    candidate's copy run eagerly against the same (bit for bit), and the uninstrumented
+    ablation against the candidate (recorded only). With keep_boxes the per-box values of
+    the D contract are kept (on the CPU, all chunks)."""
     rows, boxes = [], []
-    eager_rec = recording(EAGER_SIGMOID)
 
     def comparer(z, noise):
-        if diag is None:
-            out_e, ok_e = EAGER_SIGMOID(z, noise)
-        else:
-            (out_e, ok_e), rec_e = eager_rec(z, noise)
-        out_c, ok_c = comp(z, noise)
+        out_e, ok_e = EAGER_SIGMOID(z, noise)
+        out_x, ok_x, diag_x = precise_sigmoid_instrumented(z, noise)  # the copy, eager
         k = len(rows)
         S_, G0, N = z.rg.shape
-        row = dict(call=k, layer=k % net.sigmoid_layers + 1, S_chunk=S_, G0=G0, N=N,
-                   flag_eager=bool(ok_e), flag_compiled=bool(ok_c))
+        row = dict(call=k, layer=k % net.sigmoid_layers + 1, S_chunk=S_, G0=G0, N=N, flag_eager=bool(ok_e))
+        row["copy_identical"] = bool(all(torch.equal(getattr(out_x, n), getattr(out_e, n)) for n in OUTPUTS)
+                                     and bool(ok_x) == bool(ok_e))
+        del out_x
+        out_c, ok_c, diag_c = candidate(z, noise)
+        row["flag_compiled"] = bool(ok_c)
         shapes_ok = all(getattr(out_c, n).shape == getattr(out_e, n).shape
                         and getattr(out_c, n).dtype == getattr(out_e, n).dtype for n in OUTPUTS)
         row["shapes_ok"] = shapes_ok
+        row["d_output_identical"] = False
         if shapes_ok:
             for name in ("rc", "rg", "dc"):
                 row[f"rel_{name}"] = normwise(getattr(out_c, name), getattr(out_e, name))
@@ -532,19 +584,22 @@ def compare_layers(net, img, eps, S, comp, diag=None):
             row["d_max_shortfall_abs"] = (d_e - d_c).max().item()
             row["max_rel"] = worst_of(row[k_] for k_ in ("rel_rc", "rel_rg", "rel_dc", "rel_dg_generators",
                                                           "rel_dg_zeros"))
+            # the D the candidate returns must be the D it propagates
+            row["d_output_identical"] = bool(torch.equal(diag_c[7], d_c.reshape(-1)))
+            if keep_boxes:
+                boxes.append(dict(layer=row["layer"], D_c=d_c.reshape(-1).cpu(), D_e=d_e.reshape(-1).cpu(),
+                                  abc_c=torch.stack(diag_c[:3], dim=1).cpu(), box_c=[t.cpu() for t in diag_c[3:7]],
+                                  abc_e=torch.stack(diag_x[:3], dim=1).cpu(), box_e=[t.cpu() for t in diag_x[3:7]]))
         else:
             row["max_rel"] = math.inf
-        if diag is not None:
-            (out_d, ok_d), rec_d = diag(z, noise)
-            row["diagnostic_identical"] = bool(all(torch.equal(getattr(out_d, n), getattr(out_c, n))
-                                                   for n in OUTPUTS) and bool(ok_d) == bool(ok_c))
-            if shapes_ok and row["diagnostic_identical"]:
-                boxes.append(dict(layer=row["layer"], D_c=d_c.reshape(-1).cpu(), D_e=d_e.reshape(-1).cpu(),
-                                  abc_c=rec_d[0].cpu(), box_c=[t.cpu() for t in rec_d[1:]],
-                                  abc_e=rec_e[0].cpu(), box_e=[t.cpu() for t in rec_e[1:]]))
-            del out_d
+        out_p, ok_p = ablation(z, noise)
+        same = all(getattr(out_p, n).shape == getattr(out_c, n).shape for n in OUTPUTS)
+        for name in OUTPUTS:
+            row[f"ablation_rel_{name}"] = normwise(getattr(out_p, name), getattr(out_c, name)) if same else math.inf
+        row["ablation_identical"] = bool(same and all(torch.equal(getattr(out_p, n), getattr(out_c, n))
+                                                      for n in OUTPUTS) and bool(ok_p) == bool(ok_c))
         rows.append(row)
-        del out_c
+        del out_p, out_c
         return out_e, ok_e
 
     bs.precise_sigmoid = comparer
@@ -628,7 +683,7 @@ def gate_config(gate, net, S, trackers, sampled, eps_indices, device, bound_rows
     gate.check("G2 plane fit inside is the eager fit_planes (no nested compile)",
                plane_fit_inside(device) is planar_fit.fit_planes and not bs.USE_COMPILED_FIT, **where)
     contract_here = S == contract_s and D_CONTRACT_EPS in eps_indices
-    diag = recording(marked(torch.compile(diagnostic_sigmoid, fullgraph=True))) if contract_here else None
+    candidate, ablation = comp.with_diagnostics, trackers[ABLATION].fn
     my_contract = []
     for image_id, img in net.images:
         for e in eps_indices:
@@ -661,7 +716,7 @@ def gate_config(gate, net, S, trackers, sampled, eps_indices, device, bound_rows
                        got.max().item(), sampled[(image_id, e)], **w)
 
             with_diag = contract_here and e == D_CONTRACT_EPS
-            rows, boxes = compare_layers(net, img, eps, S, comp, diag if with_diag else None)
+            rows, boxes = compare_layers(net, img, eps, S, candidate, ablation, keep_boxes=with_diag)
             for r in rows:
                 tensor_rows.append(dict(w, **r))
             worst = worst_of(r["max_rel"] for r in rows)
@@ -669,10 +724,13 @@ def gate_config(gate, net, S, trackers, sampled, eps_indices, device, bound_rows
                        worst <= RTOL_TENSOR, worst, RTOL_TENSOR, **w)
             gate.check("G5 shapes and nonzero flag as eager",
                        all(r["shapes_ok"] and r["flag_eager"] == r["flag_compiled"] for r in rows), **w)
+            copies = sum(r["copy_identical"] for r in rows)
+            gate.check("G5 copy: the candidate run eagerly is bit-identical to batched_splits.precise_sigmoid",
+                       copies == len(rows), copies, len(rows), **w)
+            d_out = sum(r["d_output_identical"] for r in rows)
+            gate.check("G5 D output: the D the compiled candidate returns equals the D it propagates",
+                       d_out == len(rows), d_out, len(rows), **w)
             if with_diag:
-                identical = sum(r["diagnostic_identical"] for r in rows)
-                gate.check("G5 D: diagnostic graph bit-identical to the production compiled graph",
-                           identical == len(rows), identical, len(rows), **w)
                 t0 = time.perf_counter()
                 found = d_contract_rows(net, network_index, image_id, boxes)
                 my_contract += found
@@ -823,7 +881,7 @@ def cmd_shared(args):
         fresh_compiled_state()
         trackers = make_trackers()
         tr = trackers[mode]
-        code_fn = EAGER_SIGMOID if mode == COMPILED_SIGMOID else planar_fit.fit_planes
+        code_fn = precise_sigmoid_instrumented if mode == COMPILED_SIGMOID else planar_fit.fit_planes
         stopped = False
         for round_ in (1, 2):
             for name in networks:
@@ -980,7 +1038,7 @@ def cmd_steady(args):
             trackers = make_trackers()
             calls_per_pass = net.sigmoid_layers * net.chunks(S)
             try:
-                for mode in MODES:  # first pass: compiles the compiled modes (warm disk cache)
+                for mode in STEADY_MODES:  # first pass: compiles the compiled modes (warm disk cache)
                     set_mode(mode, trackers)
                     ms, b = timed_pass(mode, net, img0, eps0, S, device)
                     firsts.append(dict(network=name, S=S, mode=mode, first_ms=ms, bound=b,
@@ -993,8 +1051,8 @@ def cmd_steady(args):
                     for image_id, img in net.images:
                         for e in eps_indices:
                             for rep in range(repeats):
-                                k = rep % len(MODES)
-                                for pos, mode in enumerate(MODES[k:] + MODES[:k]):
+                                k = rep % len(STEADY_MODES)
+                                for pos, mode in enumerate(STEADY_MODES[k:] + STEADY_MODES[:k]):
                                     set_mode(mode, trackers)
                                     ms, b = timed_pass(mode, net, img, EPS_SCHEDULE[e], S, device)
                                     times.append(dict(network=name, S=S, mode=mode, image=image_id, eps_idx=e,
@@ -1008,30 +1066,32 @@ def cmd_steady(args):
                     if t["network"] == name and t["S"] == S:
                         t["rel_vs_sequential_G"] = rel(t["bound"], ref[(t["image"], t["eps_idx"])])
                 worst = {m: max(t["rel_vs_sequential_G"] for t in times
-                                if t["network"] == name and t["S"] == S and t["mode"] == m) for m in MODES}
-                for m in MODES:
-                    checks.append(dict(check="final bound vs sequential G", network=name, S=S, mode=m,
+                                if t["network"] == name and t["S"] == S and t["mode"] == m) for m in STEADY_MODES}
+                for m in STEADY_MODES:
+                    checks.append(dict(check="final bound vs sequential G", network=name, S=S, mode=m, formal=m in MODES,
                                        value=worst[m], limit=RTOL_BOUND, ok=worst[m] <= RTOL_BOUND))
 
-                for mode in MODES:
+                for mode in STEADY_MODES:
                     set_mode(mode, trackers)
                     peak, above = peak_vram(lambda: run_pass(mode, net, img0, eps0, S), device)
                     restore()
                     memory.append(dict(network=name, S=S, mode=mode, peak_mb=peak, peak_above_base_mb=above))
 
-                for mode in MODES:
+                for mode in STEADY_MODES:
                     if mode == SEQUENTIAL and S > 1:
                         continue  # S times the S = 1 count; a long trace for nothing
                     set_mode(mode, trackers)
                     c = profile_counts(lambda: run_pass(mode, net, img0, eps0, S), device)
                     restore()
                     kernels.append(dict(network=name, S=S, layer="pass", mode=mode, **c))
-                    want_regions = calls_per_pass if mode in COMPILED_MODES else 0
+                    want_regions = calls_per_pass if mode in COMPILED_MODES + [ABLATION] else 0
                     checks.append(dict(check="compiled regions per pass", network=name, S=S, mode=mode,
+                                       formal=mode in MODES,
                                        value=c["compiled_regions"], limit=want_regions,
                                        ok=c["compiled_regions"] == want_regions))
                     uses_gelsd = mode in (SEQUENTIAL, "batched_G")
                     checks.append(dict(check="lstsq used iff gelsd mode", network=name, S=S, mode=mode,
+                                       formal=mode in MODES,
                                        value=c["lstsq"], limit=">0" if uses_gelsd else 0,
                                        ok=(c["lstsq"] > 0) == uses_gelsd))
                 kernels += layer_kernels(net, S, trackers, img0, eps0, device)
@@ -1158,7 +1218,8 @@ def cmd_summarize(args):
         os.path.join(out, "gate_summary.json")) else None
     gate_ok = gate is not None and gate["failed"] == 0
     steady_checks = read_csv(os.path.join(out, "steady_checks.csv"))
-    steady_failed = [c for c in steady_checks if c.get("ok") != "True"]
+    # the ablation's checks are recorded with formal=False and stay out of C1
+    steady_failed = [c for c in steady_checks if c.get("ok") != "True" and c.get("formal") != "False"]
 
     rec = recompile_summary(out)
     write_csv(os.path.join(out, "recompiles.csv"), rec)
@@ -1168,13 +1229,13 @@ def cmd_summarize(args):
     steady = []
     for (name, S, mode), v in sorted(samples.items(), key=lambda kv: (networks.index(kv[0][0])
                                                                        if kv[0][0] in networks else 99,
-                                                                       kv[0][1], MODES.index(kv[0][2]))):
+                                                                       kv[0][1], STEADY_MODES.index(kv[0][2]))):
         steady.append(dict(network=name, S=S, mode=mode, n=len(v), median_ms=statistics.median(v),
                            min_ms=min(v), max_ms=max(v)))
     med = {(r["network"], r["S"], r["mode"]): r["median_ms"] for r in steady}
     for r in steady:
         key = (r["network"], r["S"])
-        for ref in ("batched_G", "batched_A2_eager", COMPILED_FIT):
+        for ref in ("batched_G", "batched_A2_eager", COMPILED_FIT, COMPILED_SIGMOID):
             if (key + (ref,)) in med:
                 r[f"speedup_vs_{ref}"] = med[key + (ref,)] / r["median_ms"]
     write_csv(os.path.join(out, "steady_summary.csv"), steady)
@@ -1290,6 +1351,12 @@ def cmd_summarize(args):
         outcome = "default candidate"
     report["missing"] = missing
     report["outcome"] = outcome
+    # informative, outside the outcome: what the diagnostic outputs cost the candidate
+    report["ablation_uninstrumented"] = dict(
+        note="median(candidate) / median(uninstrumented compiled graph); not part of the outcome",
+        cells=[dict(network=name, S=S, ratio=med[(name, S, COMPILED_SIGMOID)] / med[(name, S, ABLATION)])
+               for name in networks for S in splits
+               if (name, S, COMPILED_SIGMOID) in med and (name, S, ABLATION) in med])
     with open(os.path.join(out, "criteria.json"), "w") as f:
         json.dump(report, f, indent=2, default=str)
     print(json.dumps(report, indent=2, default=str))
